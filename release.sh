@@ -2,6 +2,7 @@
 # Builds the distributable files into dist/:
 #   AccountSwitcher.zip          used by the one-line terminal installer
 #   AccountSwitcher-<ver>.dmg    drag-to-Applications disk image
+#   AccountSwitcher.dmg          the same DMG under a stable name, for "latest" download links
 #
 # Signing uses the first "Developer ID Application" identity in your keychain (override with
 # SIGN_IDENTITY). Notarization runs when NOTARY_PROFILE names a profile created once with:
@@ -48,6 +49,10 @@ if [[ -n "$NOTARY_PROFILE" ]]; then
   notarize "$DMG"
   xcrun stapler staple "$DMG"
 fi
+
+# Stable name too, so https://github.com/<repo>/releases/latest/download/AccountSwitcher.dmg
+# always points at the newest DMG (a versioned name breaks links on every release).
+cp "$DMG" "$DIST/AccountSwitcher.dmg"
 
 echo
 [[ -n "$NOTARY_PROFILE" ]] && echo "Signed and notarized:" || echo "Signed, NOT notarized (set NOTARY_PROFILE):"
