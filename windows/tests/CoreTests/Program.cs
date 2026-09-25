@@ -25,6 +25,18 @@ void Write(string path, string text)
     File.WriteAllText(path, text);
 }
 
+// Directory.Delete(recursive) fails on directory junctions on Windows ("The parameter is
+// incorrect"), so remove links first — without following them — then the folders.
+void Cleanup(string dir)
+{
+    foreach (var entry in Directory.EnumerateFileSystemEntries(dir))
+    {
+        if (FileOps.IsLink(entry)) FileOps.RemoveLink(entry);
+        else if (Directory.Exists(entry)) Cleanup(entry);
+    }
+    Directory.Delete(dir, recursive: true);
+}
+
 Profile Named(string name) => DesktopProfiles.Load().Single(p => p.Name == name);
 var host = new NoDesktopHost();
 
@@ -43,7 +55,7 @@ Console.WriteLine("Swap without sharing");
     var err = DesktopProfiles.Swap(Named("Work"), host, false);
     Check(err != null && err.Contains("already exists"), "name collision is refused");
     Check(File.ReadAllText(Path.Combine(root, "Claude", "file")) == "main-data", "nothing moved on refusal");
-    Directory.Delete(root, true);
+    Cleanup(root);
 }
 
 Console.WriteLine("Swap with shared Code sessions");
@@ -92,7 +104,7 @@ Console.WriteLine("Swap with shared Code sessions");
     Check(DesktopProfiles.Swap(Named("Work"), host, true) == null && DesktopProfiles.Swap(Named("Main"), host, true) == null,
           "repeated swaps are idempotent");
     Check(Directory.GetFiles(all, "local_*").Length == 3, "still exactly three sessions");
-    Directory.Delete(root, true);
+    Cleanup(root);
 }
 
 Console.WriteLine("New account");
@@ -104,7 +116,7 @@ Console.WriteLine("New account");
     Check(p.Name == "Work-Team-1", "unsafe characters are replaced");
     Check(DesktopProfiles.Swap(p, host, true) == null, "switching to an empty profile works");
     Check(Directory.Exists(Path.Combine(root, "Claude-Profile-Personal")), "current account parked under its name");
-    Directory.Delete(root, true);
+    Cleanup(root);
 }
 
 Console.WriteLine("CLI output parsing");
