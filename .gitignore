@@ -1,3 +1,6 @@
 dist/
 *.iconset/
 .DS_Store
+windows/dist/
+windows/**/bin/
+windows/**/obj/

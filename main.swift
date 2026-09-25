@@ -120,16 +120,21 @@ func safeName(_ s: String) -> String {
 // Desktop Code sessions are small JSON files under claude-code-sessions/<account>/<org>/ that
 // point at transcripts in ~/.claude/projects (already shared by every account). Only the folder
 // path ties them to an account. To keep sessions across accounts, as Codex does:
-//  - claude-code-sessions and scratch-workspaces move out of the data folders into Claude-Shared,
-//    and every account folder gets a symlink to them (scratch sessions store absolute cwd paths
-//    under Claude/scratch-workspaces/, which then resolve for every account);
-//  - inside the shared sessions folder, every <account>/<org> folder becomes a symlink to one
-//    common _all folder, so each account lists the same sessions.
+//  - claude-code-sessions and scratch-workspaces travel with the active account: on every switch
+//    they are moved (not symlinked) from the outgoing data folder into the incoming one. Their
+//    real path is then always ~/Library/Application Support/Claude/…, which matters because
+//    Claude Code files transcripts and project memory under the *resolved* cwd; a path that
+//    changes makes it start a second transcript folder and lose sight of the project memory.
+//  - inside the sessions folder, every <account>/<org> folder is a symlink to one common _all
+//    folder, so each account lists the same sessions.
 // Only ever run while Claude Desktop is quit.
 
-let sharedRoot = "\(appSupport)/Claude-Shared"
 let sharedFolders = ["claude-code-sessions", "scratch-workspaces"]
 let commonSessions = "_all"
+/// Earlier versions kept the shared folders here behind symlinks; migrated on the next switch.
+let legacySharedRoot = "\(appSupport)/Claude-Shared"
+let claudeHome = ProcessInfo.processInfo.environment["ACCOUNT_SWITCHER_CLAUDE_HOME"]
+    ?? ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"] ?? "\(home)/.claude"
 
 func isSymlink(_ path: String) -> Bool {
     (try? FileManager.default.destinationOfSymbolicLink(atPath: path)) != nil
@@ -141,7 +146,7 @@ func isDir(_ path: String) -> Bool {
 }
 
 /// Where `merge` puts the losing side of a conflict, so a merge never deletes anything.
-let conflictsDir = "\(sharedRoot)/_conflicts"
+let conflictsDir = "\(appSupport)/Account Switcher/conflicts"
 
 /// Moves `path` into `conflictsDir` under a name that cannot clash.
 func setAside(_ path: String) throws {
@@ -152,9 +157,40 @@ func setAside(_ path: String) throws {
     try fm.moveItem(atPath: path, toPath: "\(conflictsDir)/\(name)")
 }
 
+/// Deep-merges two JSON values: objects key by key, arrays as a union (objects deduplicated by
+/// "id"/"taskId"/"sessionId" when present), plain values from `newer`.
+func mergeJSON(_ newer: Any, _ older: Any) -> Any {
+    if let n = newer as? [String: Any], let o = older as? [String: Any] {
+        var out = o
+        for (k, v) in n { out[k] = o[k].map { mergeJSON(v, $0) } ?? v }
+        return out
+    }
+    if let n = newer as? [Any], let o = older as? [Any] {
+        func key(_ x: Any) -> String {
+            if let d = x as? [String: Any], let id = d["id"] ?? d["taskId"] ?? d["sessionId"] { return "id:\(id)" }
+            let data = try? JSONSerialization.data(withJSONObject: x, options: [.sortedKeys, .fragmentsAllowed])
+            return data.map { String(decoding: $0, as: UTF8.self) } ?? "\(x)"
+        }
+        var seen = Set(n.map(key))
+        return n + o.filter { seen.insert(key($0)).inserted }
+    }
+    return newer
+}
+
+/// Writes the merge of two JSON files into `d`. False when either side is not JSON.
+/// Needed because each account keeps same-named state files next to its sessions
+/// (scheduled-tasks.json, archived-sessions.idx): "newer wins" let a freshly signed-in account's
+/// empty scheduled-tasks.json replace another account's schedules.
+func mergeJSONFiles(newer: String, older: String, into d: String) -> Bool {
+    guard let n = try? JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: newer))),
+          let o = try? JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: older))),
+          let data = try? JSONSerialization.data(withJSONObject: mergeJSON(n, o)) else { return false }
+    return (try? data.write(to: URL(fileURLWithPath: d), options: .atomic)) != nil
+}
+
 /// Moves everything in `src` into `dst`, recursing into folders both sides have. On a conflict
-/// the newer copy takes the place and the other one is set aside in `conflictsDir`. `src` is
-/// removed afterwards (it is empty by then).
+/// JSON files are merged; otherwise the newer copy takes the place. The other copy is always set
+/// aside in `conflictsDir`. `src` is removed afterwards (it is empty by then).
 func merge(_ src: String, into dst: String) throws {
     let fm = FileManager.default
     if !fm.fileExists(atPath: dst) && !isSymlink(dst) { try fm.moveItem(atPath: src, toPath: dst); return }
@@ -167,7 +203,10 @@ func merge(_ src: String, into dst: String) throws {
         } else {
             let sDate = (try? fm.attributesOfItem(atPath: s)[.modificationDate] as? Date) ?? .distantPast
             let dDate = (try? fm.attributesOfItem(atPath: d)[.modificationDate] as? Date) ?? .distantPast
-            if sDate > dDate && !isSymlink(d) {
+            let plainFiles = !isDir(s) && !isDir(d) && !isSymlink(s) && !isSymlink(d)
+            if plainFiles && mergeJSONFiles(newer: sDate > dDate ? s : d, older: sDate > dDate ? d : s, into: d) {
+                try setAside(s)
+            } else if sDate > dDate && !isSymlink(d) {
                 try setAside(d)
                 try fm.moveItem(atPath: s, toPath: d)
             } else {
@@ -178,28 +217,35 @@ func merge(_ src: String, into dst: String) throws {
     try fm.removeItem(atPath: src)
 }
 
-/// Points `profileDir`'s shared folders at Claude-Shared, merging in whatever it had.
-func linkShared(_ profileDir: String) throws {
+/// Gathers the shared folders into `active` as real folders: the outgoing account's copy
+/// (`parked`), any leftover from the old symlinked layout, and whatever `active` had of its own.
+func carryShared(from parked: String?, to active: String) throws {
     let fm = FileManager.default
-    try fm.createDirectory(atPath: sharedRoot, withIntermediateDirectories: true)
     for name in sharedFolders {
-        let local = "\(profileDir)/\(name)", shared = "\(sharedRoot)/\(name)"
-        if isSymlink(local) {
-            // A link that resolves is left alone (it may be the user's own); a dangling one,
-            // e.g. from an older shared location, holds no data and is replaced.
-            if fm.fileExists(atPath: local) { continue }
-            try fm.removeItem(atPath: local)
+        let dest = "\(active)/\(name)"
+        if isSymlink(dest) { try fm.removeItem(atPath: dest) }
+        var sources = ["\(legacySharedRoot)/\(name)"]
+        if let parked { sources.insert("\(parked)/\(name)", at: 0) }
+        for src in sources {
+            if isSymlink(src) { try fm.removeItem(atPath: src); continue }
+            if isDir(src) { try merge(src, into: dest) }
         }
-        if fm.fileExists(atPath: local) { try merge(local, into: shared) }
-        try fm.createDirectory(atPath: shared, withIntermediateDirectories: true)
-        try fm.createSymbolicLink(atPath: local, withDestinationPath: shared)
+    }
+    // Retire the old location, but only once nothing is left in it (removeItem is recursive).
+    guard isDir(legacySharedRoot) else { return }
+    if isDir("\(legacySharedRoot)/_conflicts") {
+        try merge("\(legacySharedRoot)/_conflicts", into: conflictsDir)
+    }
+    try? fm.removeItem(atPath: "\(legacySharedRoot)/.DS_Store")
+    if (try? fm.contentsOfDirectory(atPath: legacySharedRoot))?.isEmpty == true {
+        try fm.removeItem(atPath: legacySharedRoot)
     }
 }
 
 /// Makes every <account>/<org> session folder a symlink to the common one.
-func unifySessions() throws {
+func unifySessions(in active: String) throws {
     let fm = FileManager.default
-    let root = "\(sharedRoot)/claude-code-sessions", common = "\(root)/\(commonSessions)"
+    let root = "\(active)/claude-code-sessions", common = "\(root)/\(commonSessions)"
     guard isDir(root) else { return }
     try fm.createDirectory(atPath: common, withIntermediateDirectories: true)
     for account in try fm.contentsOfDirectory(atPath: root) where account != commonSessions {
@@ -210,6 +256,56 @@ func unifySessions() throws {
             if isSymlink(orgDir) || !isDir(orgDir) { continue }
             try merge(orgDir, into: common)
             try fm.createSymbolicLink(atPath: orgDir, withDestinationPath: "../\(commonSessions)")
+        }
+    }
+}
+
+/// Folder prefixes that scratch sessions may have been started under before the shared folders
+/// settled at `activeDir`: the old Claude-Shared location and every parked profile.
+func strayScratchRoots() -> [String] {
+    let names = (try? FileManager.default.contentsOfDirectory(atPath: appSupport)) ?? []
+    return ["\(legacySharedRoot)/scratch-workspaces"]
+        + names.filter { $0.hasPrefix(parkedPrefix) }.map { "\(appSupport)/\($0)/scratch-workspaces" }
+}
+
+/// Claude Code's folder name for a cwd under ~/.claude/projects: every non-alphanumeric
+/// character becomes "-".
+func projectKey(_ path: String) -> String {
+    String(path.map { $0.isASCII && ($0.isLetter || $0.isNumber) ? $0 : "-" })
+}
+
+/// Repairs sessions that ran under a stray path: points their cwd back at `activeDir` and merges
+/// the transcript/memory folders Claude Code created for the stray path into the canonical one.
+func repairScratchPaths(in active: String) throws {
+    let fm = FileManager.default
+    let canonical = "\(active)/scratch-workspaces"
+    let stray = strayScratchRoots()
+
+    let common = "\(active)/claude-code-sessions/\(commonSessions)"
+    for file in (try? fm.contentsOfDirectory(atPath: common)) ?? [] where file.hasSuffix(".json") {
+        let path = "\(common)/\(file)"
+        guard var d = (try? JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path)))) as? [String: Any]
+        else { continue }
+        var changed = false
+        for key in ["cwd", "originCwd"] {
+            guard let v = d[key] as? String else { continue }
+            for root in stray where v.hasPrefix(root + "/") || v == root {
+                d[key] = canonical + v.dropFirst(root.count)
+                changed = true
+            }
+        }
+        if changed, let data = try? JSONSerialization.data(withJSONObject: d) {
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        }
+    }
+
+    let projects = "\(claudeHome)/projects"
+    let canonicalKey = projectKey(canonical)
+    for dir in (try? fm.contentsOfDirectory(atPath: projects)) ?? [] {
+        for root in stray.map(projectKey) where dir.hasPrefix(root) {
+            let target = canonicalKey + dir.dropFirst(root.count)
+            try merge("\(projects)/\(dir)", into: "\(projects)/\(target)")
+            break
         }
     }
 }
@@ -255,9 +351,9 @@ func swapDesktop(to target: Profile) -> String? {
     // here must not block the switch itself.
     var warning: String?
     if Prefs.shareCodeSessions { do {
-        if hasActive { try linkShared(parkedCurrent) }
-        try linkShared(activeDir)
-        try unifySessions()
+        try carryShared(from: hasActive ? parkedCurrent : nil, to: activeDir)
+        try unifySessions(in: activeDir)
+        try repairScratchPaths(in: activeDir)
     } catch {
         warning = "Switched, but sharing Code sessions failed: \(error.localizedDescription)"
     } }

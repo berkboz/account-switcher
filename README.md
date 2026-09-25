@@ -4,6 +4,9 @@ One menu bar icon for switching between accounts in **Claude Desktop**, **Claude
 and **Codex**. Useful when you have a work subscription and a personal one and keep hitting limits
 on one of them.
 
+> **Windows:** a preview port lives in [`windows/`](windows/README.md) —
+> `irm https://raw.githubusercontent.com/berkboz/account-switcher/main/windows/install.ps1 | iex`
+
 ## Install
 
 Pick one. All three install the same app: the DMG into `/Applications`, the other two into
@@ -68,9 +71,11 @@ to switch.
 switch, and continue the same Code session on the other. Regular chats (the Chat tab) stay with
 their account — they live on Claude's servers. A brand-new account's first sessions join the
 shared list after its next switch. The first switch into a new account downloads Claude Code's
-runtime once, so that first Code session starts slower. If the same file exists on both sides
-when sessions are merged, the newer copy is kept and the other is moved to
-`Claude-Shared/_conflicts` — nothing is deleted.
+runtime once, so that first Code session starts slower. The shared folders move with the active
+account rather than being linked, so Claude Code keeps one transcript and one project memory per
+session. If the same file exists on both sides when sessions are merged, JSON state files are
+combined and otherwise the newer copy is kept; the other copy is moved to
+`~/Library/Application Support/Account Switcher/conflicts`. Nothing is deleted.
 
 ### Claude Code in a terminal
 
@@ -146,7 +151,7 @@ Each account line shows quota: Claude shows how much you have **used**, Codex ho
 | `~/Applications/Account Switcher.app` | The app (`/Applications` when installed from the DMG) |
 | `~/Library/Application Support/Claude` | The desktop account that is active now |
 | `~/Library/Application Support/Claude-Profile-<name>` | A parked desktop account |
-| `~/Library/Application Support/Claude-Shared` | Code sessions and scratch folders every account shares |
+| `~/Library/Application Support/Account Switcher/conflicts` | Copies set aside when merging shared Code sessions (nothing is deleted) |
 | `~/.local/share/account-switcher/README.md` | This guide (menu → Help; opens this page online when missing) |
 
 ## Uninstall

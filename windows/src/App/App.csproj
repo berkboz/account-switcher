@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <!-- Lets the Windows app build (not run) on macOS/Linux, e.g. for CI or release packaging. -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>AccountSwitcher</RootNamespace>
+    <AssemblyName>AccountSwitcher</AssemblyName>
+    <ApplicationIcon>AppIcon.ico</ApplicationIcon>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <Product>Account Switcher</Product>
+    <Version>1.1.0</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="AppIcon.ico" LogicalName="AppIcon.ico" />
+    <ProjectReference Include="../Core/Core.csproj" />
+  </ItemGroup>
+</Project>

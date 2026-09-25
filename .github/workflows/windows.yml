@@ -1,0 +1,48 @@
+name: Windows
+
+on:
+  push:
+    paths: ["windows/**", ".github/workflows/windows.yml"]
+  pull_request:
+    paths: ["windows/**"]
+  release:
+    types: [published]
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    permissions:
+      contents: write   # to attach the zips to a release
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # Real Windows: session links are directory junctions here.
+      - name: Core tests
+        run: dotnet run --project tests/CoreTests -c Release
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          foreach ($rid in 'win-x64', 'win-arm64') {
+            dotnet publish src/App/App.csproj -c Release -r $rid --self-contained true `
+              -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
+              -p:EnableCompressionInSingleFile=true -p:DebugType=none -o "dist/$rid"
+            Compress-Archive "dist/$rid/AccountSwitcher.exe" "dist/AccountSwitcher-$rid.zip" -Force
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AccountSwitcher-windows
+          path: windows/dist/*.zip
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/AccountSwitcher-win-x64.zip dist/AccountSwitcher-win-arm64.zip --clobber
