@@ -1,3 +1,6 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
 namespace AccountSwitcher.Core;
 
 public sealed record Profile(string Name, string Dir)
@@ -31,7 +34,11 @@ public sealed class NoDesktopHost : IDesktopHost
 // account — moved, not linked, on every switch — so their real path is always …\Claude\….
 // Claude Code files transcripts and project memory under the resolved cwd, so a path that
 // changes would split transcripts. Inside the sessions folder every <account>\<org> folder is a
-// link to one common _all folder, so every account lists the same sessions.
+// real folder, and on each switch every session file's newest copy is copied into all of them, so
+// every account lists the same sessions. They must not be links: Claude refuses to save into a
+// junction or symlink there ("Refusing non-directory at private dir path"), while still reading
+// through it, so new sessions lived only in memory and were gone after the next quit. 1.1.0 used
+// a shared _all folder behind junctions; SyncSessions migrates it.
 public static class DesktopProfiles
 {
     public static readonly string[] SharedFolders = ["claude-code-sessions", "scratch-workspaces"];
@@ -121,9 +128,15 @@ public static class DesktopProfiles
             try
             {
                 CarryShared(hasActive ? parkedCurrent : null, Paths.ActiveDir);
-                UnifySessions(Paths.ActiveDir);
+                SyncSessions(Paths.ActiveDir);
             }
             catch (Exception e) { warning = $"Switched, but sharing Code sessions failed: {e.Message}"; }
+        }
+        else if (SessionsNeedRepair())
+        {
+            // Sharing is off, but junctions left by 1.1.0 would still stop Claude from saving.
+            try { SyncSessions(Paths.ActiveDir); }
+            catch (Exception e) { warning = $"Switched, but repairing Code sessions failed: {e.Message}"; }
         }
         host.Launch();
         return warning;
@@ -149,13 +162,12 @@ public static class DesktopProfiles
         }
     }
 
-    /// Makes every <account>\<org> session folder a link to the common one.
-    public static void UnifySessions(string active)
+    /// The real <account>\<org> session folders under `root`, turning a linked one (the 1.1.0
+    /// layout) into an empty real folder first. Removing a link never touches its target.
+    public static List<string> SessionFolders(string root)
     {
-        var root = Path.Combine(active, "claude-code-sessions");
-        var common = Path.Combine(root, CommonSessions);
-        if (!Directory.Exists(root)) return;
-        Directory.CreateDirectory(common);
+        var list = new List<string>();
+        if (!Directory.Exists(root)) return list;
         foreach (var accountDir in Directory.EnumerateDirectories(root).ToList())
         {
             if (Path.GetFileName(accountDir) == CommonSessions || FileOps.IsLink(accountDir)) continue;
@@ -163,18 +175,122 @@ public static class DesktopProfiles
             {
                 if (FileOps.IsLink(orgDir))
                 {
-                    // Junctions are absolute; one pointing anywhere but the current _all is stale.
-                    var t = new DirectoryInfo(orgDir).LinkTarget;
-                    if (t == null || Path.GetFullPath(t, accountDir).TrimEnd('\\', '/') == Path.GetFullPath(common).TrimEnd('\\', '/'))
-                        continue;
                     FileOps.RemoveLink(orgDir);
+                    Directory.CreateDirectory(orgDir);
                 }
-                else
-                {
-                    FileOps.Merge(orgDir, common);
-                }
-                FileOps.CreateDirLink(orgDir, common);
+                list.Add(orgDir);
             }
         }
+        return list;
+    }
+
+    /// Makes every <account>\<org> session folder hold the same sessions: for each file the newest
+    /// copy wins, small state files (scheduled-tasks.json, archived-sessions.idx) are merged, and a
+    /// session deleted in one folder since the last sync is removed from the others (set aside,
+    /// never deleted). Subfolders only Claude knows about are left alone.
+    public static void SyncSessions(string active)
+    {
+        var root = Path.Combine(active, "claude-code-sessions");
+        if (!Directory.Exists(root)) return;
+        var folders = SessionFolders(root);
+        var legacy = Path.Combine(root, CommonSessions);
+        var sources = new List<string>(folders);
+        if (Directory.Exists(legacy) && !FileOps.IsLink(legacy)) sources.Add(legacy);
+        if (sources.Count == 0) return;
+
+        string Key(string folder) => Path.GetRelativePath(root, folder).Replace('\\', '/');
+        static HashSet<string> Files(string folder) => Directory.EnumerateFiles(folder)
+            .Where(f => !FileOps.IsLink(f)).Select(f => Path.GetFileName(f))
+            .Where(n => !n.StartsWith('.') && !n.Contains(".as-tmp-")).ToHashSet();
+        var present = sources.ToDictionary(f => f, Files);
+
+        // Sessions that disappeared from a folder since the last sync were deleted there by Claude.
+        var previous = ReadManifest();
+        var deleted = new HashSet<string>();
+        foreach (var folder in folders)
+            if (previous.TryGetValue(Key(folder), out var before))
+                deleted.UnionWith(before.Where(n => n.StartsWith("local_") && !present[folder].Contains(n)));
+
+        foreach (var name in present.Values.SelectMany(x => x).Distinct().ToList())
+        {
+            var copies = sources.Where(f => present[f].Contains(name)).Select(f => Path.Combine(f, name))
+                                .OrderByDescending(File.GetLastWriteTimeUtc).ToList();
+            if (deleted.Contains(name))
+            {
+                foreach (var c in copies) FileOps.SetAside(c);
+                continue;
+            }
+            var newest = copies[0];
+            // State files sit next to the sessions under the same name in every folder; merge them
+            // so one account's schedules or archive list do not replace another's.
+            string? merged = null;
+            if (!name.StartsWith("local_") && copies.Count > 1)
+            {
+                try
+                {
+                    var values = copies.Select(c => JsonNode.Parse(File.ReadAllText(c))).ToList();
+                    merged = values.Skip(1).Aggregate(values[0], (acc, v) => FileOps.MergeJson(acc, v))?.ToJsonString() ?? "null";
+                }
+                catch (JsonException) { merged = null; }
+            }
+            foreach (var folder in folders)
+            {
+                var d = Path.Combine(folder, name);
+                if (merged != null)
+                {
+                    if (!File.Exists(d) || File.ReadAllText(d) != merged) FileOps.WriteAtomic(d, merged);
+                }
+                else if (d != newest && (!File.Exists(d) || !FileOps.SameContent(d, newest)))
+                {
+                    FileOps.CopyReplacing(newest, d);
+                }
+            }
+        }
+
+        // Every session now lives in the real folders; keep the old shared folder aside, not deleted.
+        if (sources.Contains(legacy) && folders.Count > 0) FileOps.SetAside(legacy);
+        WriteManifest(folders.ToDictionary(Key, f => Files(f).OrderBy(n => n, StringComparer.Ordinal).ToList()));
+    }
+
+    static Dictionary<string, List<string>> ReadManifest()
+    {
+        try { return JsonSerializer.Deserialize<Dictionary<string, List<string>>>(File.ReadAllText(Paths.SessionManifest)) ?? []; }
+        catch { return []; }
+    }
+
+    static void WriteManifest(Dictionary<string, List<string>> manifest)
+    {
+        Directory.CreateDirectory(Paths.AppDir);
+        FileOps.WriteAtomic(Paths.SessionManifest, JsonSerializer.Serialize(manifest));
+    }
+
+    /// True when a session folder is still a link, which Claude can no longer save into.
+    public static bool SessionsNeedRepair()
+    {
+        var root = Path.Combine(Paths.ActiveDir, "claude-code-sessions");
+        try
+        {
+            return Directory.Exists(root) && Directory.EnumerateDirectories(root)
+                .Where(a => Path.GetFileName(a) != CommonSessions && !FileOps.IsLink(a))
+                .SelectMany(Directory.EnumerateDirectories).Any(FileOps.IsLink);
+        }
+        catch { return false; }
+    }
+
+    /// Turns linked session folders back into real ones without switching accounts: quits Claude,
+    /// syncs, reopens.
+    public static string? RepairSessions(IDesktopHost host)
+    {
+        var wasRunning = host.IsRunning;
+        if (wasRunning)
+        {
+            if (!host.Quit()) return "Claude did not quit, so nothing was changed.";
+            Thread.Sleep(1000);
+        }
+        string? error = null;
+        try { SyncSessions(Paths.ActiveDir); }
+        catch (Exception e) { error = $"Could not repair Code sessions: {e.Message}"; }
+        if (wasRunning) host.Launch();
+        return error;
     }
 }

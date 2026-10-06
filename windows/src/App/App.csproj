@@ -12,7 +12,7 @@
     <ApplicationIcon>AppIcon.ico</ApplicationIcon>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <Product>Account Switcher</Product>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
   </PropertyGroup>
   <ItemGroup>
     <EmbeddedResource Include="AppIcon.ico" LogicalName="AppIcon.ico" />

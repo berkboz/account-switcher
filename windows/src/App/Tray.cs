@@ -127,6 +127,9 @@ sealed class Tray : ApplicationContext
 
         if (Settings.ShowDesktop)
         {
+            if (DesktopProfiles.SessionsNeedRepair())
+                Item("⚠ Repair Code Sessions…", RepairSessions, !busy).ToolTipText =
+                    "Claude cannot save Code sessions into the folder layout of earlier versions. New sessions are lost when it quits until this is repaired.";
             Header("Claude Desktop", "Includes its Code tab");
             foreach (var p in profiles)
                 Item(p.Name, () => SwitchDesktop(p), !busy && !p.Active,
@@ -199,6 +202,21 @@ sealed class Tray : ApplicationContext
             if (error != null && cleanupOnError)
                 try { Directory.Delete(target.Dir); } catch { }   // only if still empty
             Notify("Claude Desktop", error ?? $"Switched to {target.Name}");
+            ui.Post(_ => { SetBusy(false); Refresh(); }, null);
+        });
+    }
+
+    void RepairSessions()
+    {
+        if (desktop.IsRunning &&
+            MessageBox.Show("Claude cannot save Code sessions in the folder layout earlier versions of Account Switcher set up, so new sessions disappear when it quits. Claude will quit and reopen; your sessions are kept.",
+                            "Repair Code sessions?", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+            return;
+        SetBusy(true);
+        Task.Run(() =>
+        {
+            var error = DesktopProfiles.RepairSessions(desktop);
+            Notify("Claude Desktop", error ?? "Code sessions repaired");
             ui.Post(_ => { SetBusy(false); Refresh(); }, null);
         });
     }

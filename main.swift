@@ -125,9 +125,13 @@ func safeName(_ s: String) -> String {
 //    real path is then always ~/Library/Application Support/Claude/…, which matters because
 //    Claude Code files transcripts and project memory under the *resolved* cwd; a path that
 //    changes makes it start a second transcript folder and lose sight of the project memory.
-//  - inside the sessions folder, every <account>/<org> folder is a symlink to one common _all
-//    folder, so each account lists the same sessions.
-// Only ever run while Claude Desktop is quit.
+//  - inside the sessions folder, every <account>/<org> folder is a real folder, and on each
+//    switch every session file's newest copy is copied into all of them, so each account lists
+//    the same sessions. They must not be symlinks: Claude 2.19x opens that folder with O_NOFOLLOW,
+//    can still read sessions through a link but fails every save ("ENOTDIR"), so new sessions
+//    lived only in memory and were gone after the next quit. Versions 1.1.x used a shared "_all"
+//    folder behind such links; syncSessions migrates it.
+// Only ever run while Claude Desktop is quit (or, for a repair, while it cannot save anyway).
 
 let sharedFolders = ["claude-code-sessions", "scratch-workspaces"]
 let commonSessions = "_all"
@@ -242,22 +246,127 @@ func carryShared(from parked: String?, to active: String) throws {
     }
 }
 
-/// Makes every <account>/<org> session folder a symlink to the common one.
-func unifySessions(in active: String) throws {
+/// What syncSessions saw in each <account>/<org> folder last time, so a session the user deleted
+/// on one account is removed from the others instead of being copied back.
+let sessionManifest = "\(appSupport)/Account Switcher/session-sync.json"
+
+/// The real <account>/<org> session folders under `root`, turning any symlinked one (the 1.1.x
+/// layout) into an empty real folder first.
+func sessionFolders(_ root: String) throws -> [String] {
     let fm = FileManager.default
-    let root = "\(active)/claude-code-sessions", common = "\(root)/\(commonSessions)"
-    guard isDir(root) else { return }
-    try fm.createDirectory(atPath: common, withIntermediateDirectories: true)
-    for account in try fm.contentsOfDirectory(atPath: root) where account != commonSessions {
+    var out: [String] = []
+    for account in (try? fm.contentsOfDirectory(atPath: root)) ?? [] where account != commonSessions {
         let accountDir = "\(root)/\(account)"
         guard isDir(accountDir), !isSymlink(accountDir) else { continue }
         for org in try fm.contentsOfDirectory(atPath: accountDir) {
             let orgDir = "\(accountDir)/\(org)"
-            if isSymlink(orgDir) || !isDir(orgDir) { continue }
-            try merge(orgDir, into: common)
-            try fm.createSymbolicLink(atPath: orgDir, withDestinationPath: "../\(commonSessions)")
+            if isSymlink(orgDir) {
+                try fm.removeItem(atPath: orgDir)    // removes the link only, never its target
+                try fm.createDirectory(atPath: orgDir, withIntermediateDirectories: false,
+                                       attributes: [.posixPermissions: 0o700])
+            }
+            if isDir(orgDir) { out.append(orgDir) }
         }
     }
+    return out
+}
+
+func modDate(_ path: String) -> Date {
+    (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as? Date) ?? .distantPast
+}
+
+/// Replaces `dst` with a copy of `src` in one rename, keeping `src`'s modification date (which
+/// decides the newest copy next time).
+func copyReplacing(_ src: String, _ dst: String) throws {
+    let fm = FileManager.default
+    let tmp = "\(dst).as-tmp-\(UUID().uuidString.prefix(8))"
+    try fm.copyItem(atPath: src, toPath: tmp)
+    try fm.setAttributes([.modificationDate: modDate(src)], ofItemAtPath: tmp)
+    _ = try fm.replaceItemAt(URL(fileURLWithPath: dst), withItemAt: URL(fileURLWithPath: tmp))
+}
+
+/// Makes every <account>/<org> session folder hold the same sessions: for each file the newest
+/// copy wins, small state files (scheduled-tasks.json, archived-sessions.idx) are merged, and a
+/// session deleted in one folder since the last sync is removed from the others (set aside in
+/// `conflictsDir`, never deleted). Folders and files only Claude knows about are left alone.
+func syncSessions(in active: String) throws {
+    let fm = FileManager.default
+    let root = "\(active)/claude-code-sessions"
+    guard isDir(root) else { return }
+    let folders = try sessionFolders(root)
+    let legacy = "\(root)/\(commonSessions)"
+    let sources = folders + (isDir(legacy) && !isSymlink(legacy) ? [legacy] : [])
+    guard !sources.isEmpty else { return }
+
+    func key(_ folder: String) -> String { String(folder.dropFirst(root.count + 1)) }
+    func files(_ folder: String) -> Set<String> {
+        Set(((try? fm.contentsOfDirectory(atPath: folder)) ?? []).filter {
+            !$0.hasPrefix(".") && !$0.contains(".as-tmp-") && !isDir("\(folder)/\($0)") && !isSymlink("\(folder)/\($0)")
+        })
+    }
+    let present = Dictionary(uniqueKeysWithValues: sources.map { ($0, files($0)) })
+
+    // Sessions that disappeared from a folder since the last sync were deleted there by Claude.
+    let previous = ((try? JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: sessionManifest))))
+        as? [String: [String]]) ?? [:]
+    var deleted = Set<String>()
+    for folder in folders {
+        guard let before = previous[key(folder)] else { continue }
+        deleted.formUnion(Set(before).subtracting(present[folder] ?? []).filter { $0.hasPrefix("local_") })
+    }
+
+    for name in present.values.reduce(Set<String>(), { $0.union($1) }) {
+        let copies = sources.filter { present[$0]?.contains(name) == true }
+            .map { "\($0)/\(name)" }.sorted { modDate($0) > modDate($1) }
+        if deleted.contains(name) {
+            for c in copies { try setAside(c) }
+            continue
+        }
+        guard let newest = copies.first else { continue }
+        // State files sit next to the sessions under the same name in every folder; merge them so
+        // one account's schedules or archive list do not replace another's.
+        var merged: Data?
+        if !name.hasPrefix("local_"), copies.count > 1 {
+            let values = copies.compactMap { try? JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: $0))) }
+            if values.count == copies.count, let first = values.first {
+                merged = try? JSONSerialization.data(withJSONObject: values.dropFirst().reduce(first) { mergeJSON($0, $1) })
+            }
+        }
+        for folder in folders {
+            let d = "\(folder)/\(name)"
+            if let merged {
+                if (try? Data(contentsOf: URL(fileURLWithPath: d))) != merged {
+                    try merged.write(to: URL(fileURLWithPath: d), options: .atomic)
+                }
+            } else if d != newest && (!fm.fileExists(atPath: d) || !fm.contentsEqual(atPath: d, andPath: newest)) {
+                if fm.fileExists(atPath: d) { try copyReplacing(newest, d) } else {
+                    try fm.copyItem(atPath: newest, toPath: d)
+                    try fm.setAttributes([.modificationDate: modDate(newest)], ofItemAtPath: d)
+                }
+            }
+        }
+    }
+
+    // Every session now lives in the real folders; keep the old shared folder aside, not deleted.
+    if sources.contains(legacy) && !folders.isEmpty { try setAside(legacy) }
+
+    var manifest: [String: [String]] = [:]
+    for folder in folders { manifest[key(folder)] = files(folder).sorted() }
+    try fm.createDirectory(atPath: (sessionManifest as NSString).deletingLastPathComponent,
+                           withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
+        .write(to: URL(fileURLWithPath: sessionManifest), options: .atomic)
+}
+
+/// True when a session folder is still a symlink, which Claude can no longer save into.
+func sessionsNeedRepair() -> Bool {
+    let fm = FileManager.default
+    let root = "\(activeDir)/claude-code-sessions"
+    for account in (try? fm.contentsOfDirectory(atPath: root)) ?? [] where account != commonSessions {
+        for org in (try? fm.contentsOfDirectory(atPath: "\(root)/\(account)")) ?? []
+        where isSymlink("\(root)/\(account)/\(org)") { return true }
+    }
+    return false
 }
 
 /// Folder prefixes that scratch sessions may have been started under before the shared folders
@@ -281,9 +390,10 @@ func repairScratchPaths(in active: String) throws {
     let canonical = "\(active)/scratch-workspaces"
     let stray = strayScratchRoots()
 
-    let common = "\(active)/claude-code-sessions/\(commonSessions)"
-    for file in (try? fm.contentsOfDirectory(atPath: common)) ?? [] where file.hasSuffix(".json") {
-        let path = "\(common)/\(file)"
+    let sessionFiles = ((try? sessionFolders("\(active)/claude-code-sessions")) ?? []).flatMap { folder in
+        ((try? fm.contentsOfDirectory(atPath: folder)) ?? []).filter { $0.hasSuffix(".json") }.map { "\(folder)/\($0)" }
+    }
+    for path in sessionFiles {
         guard var d = (try? JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path)))) as? [String: Any]
         else { continue }
         var changed = false
@@ -350,15 +460,39 @@ func swapDesktop(to target: Profile) -> String? {
     // Claude is quit, so this is the safe moment to (re)link shared Code sessions. A failure
     // here must not block the switch itself.
     var warning: String?
-    if Prefs.shareCodeSessions { do {
-        try carryShared(from: hasActive ? parkedCurrent : nil, to: activeDir)
-        try unifySessions(in: activeDir)
-        try repairScratchPaths(in: activeDir)
+    do {
+        if Prefs.shareCodeSessions {
+            try carryShared(from: hasActive ? parkedCurrent : nil, to: activeDir)
+            try syncSessions(in: activeDir)
+            try repairScratchPaths(in: activeDir)
+        } else if sessionsNeedRepair() {
+            // Sharing is off, but links left by 1.1.x would still stop Claude from saving.
+            try syncSessions(in: activeDir)
+        }
     } catch {
         warning = "Switched, but sharing Code sessions failed: \(error.localizedDescription)"
-    } }
+    }
     if !testMode { run(args: ["open", "-b", claudeBundle]) }
     return warning
+}
+
+/// Turns symlinked session folders back into real ones without switching accounts: quits
+/// Claude, syncs, reopens. With `force` it skips the quit (Claude cannot save into the links
+/// anyway, so nothing it writes can be lost).
+func repairSessions(force: Bool = false) -> String? {
+    let wasRunning = !testMode && isRunning(claudeBundle)
+    if wasRunning && !force {
+        if !quitApp(claudeBundle) { return "Claude did not quit, so nothing was changed." }
+        Thread.sleep(forTimeInterval: 1)
+    }
+    do {
+        try syncSessions(in: activeDir)
+        try repairScratchPaths(in: activeDir)
+    } catch {
+        return "Could not repair Code sessions: \(error.localizedDescription)"
+    }
+    if wasRunning && !force { run(args: ["open", "-b", claudeBundle]) }
+    return nil
 }
 
 // MARK: - CLI-backed accounts
@@ -695,6 +829,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: entry.size, weight: .regular))
         image?.isTemplate = true
         item.button?.image = image
+        // variableLength leaves about 1pt more beside this glyph than beside the system's own
+        // icons; size the item to the glyph so the spacing matches its neighbours.
+        item.length = ceil(image?.size.width ?? 18) - 2
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: TimeInterval(Prefs.refreshSeconds), repeats: true) {
             [weak self] _ in self?.refresh()
@@ -754,7 +891,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func rebuild() {
         menu.removeAllItems()
 
-        if Prefs.showDesktop { desktopSection(); menu.addItem(.separator()) }
+        if Prefs.showDesktop {
+            if sessionsNeedRepair() {
+                let fix = add("⚠︎ Repair Code Sessions…", #selector(repairSessionsAction), enabled: !busy)
+                fix.toolTip = "Claude cannot save Code sessions into the shared folder layout of earlier versions. New sessions are lost when it quits until this is repaired."
+            }
+            desktopSection()
+            menu.addItem(.separator())
+        }
         if Prefs.showClaudeCode {
             section("Claude Code (Terminal)", claude, tool: "claude", nextKey: "l")
             menu.addItem(.separator())
@@ -837,6 +981,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.global().async {
             let err = swapDesktop(to: target)
             notify("Claude Desktop", err ?? "Switched to \(target.name)")
+            DispatchQueue.main.async { self.busy = false; self.refresh() }
+        }
+    }
+
+    @objc func repairSessionsAction() {
+        if isRunning(claudeBundle) {
+            guard confirm("Repair Code sessions?",
+                          "Claude cannot save Code sessions in the folder layout earlier versions of Account Switcher set up, so new sessions disappear when it quits. Claude will quit and reopen; your sessions are kept.",
+                          "Quit & Repair") else { return }
+        }
+        busy = true
+        rebuild()
+        DispatchQueue.global().async {
+            let err = repairSessions()
+            notify("Claude Desktop", err ?? "Code sessions repaired")
             DispatchQueue.main.async { self.busy = false; self.refresh() }
         }
     }
@@ -1008,6 +1167,12 @@ if CommandLine.arguments.contains("--dump") {
     loadClaudeAccounts().forEach { print("Claude ", $0.active ? "*" : " ", $0.email, "|", $0.detail) }
     loadCodexAccounts().forEach { print("Codex  ", $0.active ? "*" : " ", $0.email, "|", $0.detail) }
     print("Codex auto-switch:", CodexAuto.load().on ? "on" : "off")
+    exit(0)
+}
+
+// Repairs the session folders from a terminal. --force skips quitting Claude.
+if CommandLine.arguments.contains("--sync-sessions") {
+    print(repairSessions(force: CommandLine.arguments.contains("--force")) ?? "ok")
     exit(0)
 }
 

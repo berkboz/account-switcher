@@ -73,9 +73,16 @@ their account — they live on Claude's servers. A brand-new account's first ses
 shared list after its next switch. The first switch into a new account downloads Claude Code's
 runtime once, so that first Code session starts slower. The shared folders move with the active
 account rather than being linked, so Claude Code keeps one transcript and one project memory per
-session. If the same file exists on both sides when sessions are merged, JSON state files are
-combined and otherwise the newer copy is kept; the other copy is moved to
-`~/Library/Application Support/Account Switcher/conflicts`. Nothing is deleted.
+session. Each account keeps its own real session folder and the switch copies every session's
+newest version into all of them; a session you delete on one account is removed from the others.
+Small state files (scheduled tasks, the archive list) are combined. Anything replaced or removed
+this way is moved to `~/Library/Application Support/Account Switcher/conflicts`. Nothing is deleted.
+
+> **Updating from 1.1.0?** Claude Desktop 2.19 and later cannot save Code sessions into the
+> linked folder 1.1.0 set up, so sessions started since then disappear when Claude quits. The menu
+> shows **⚠︎ Repair Code Sessions…** until the next switch fixes it; click it to repair right away
+> (Claude quits and reopens). Sessions lost before the repair still have their transcripts in
+> `~/.claude/projects`.
 
 ### Claude Code in a terminal
 
@@ -124,6 +131,7 @@ Two side effects to know:
 | **Next … Account** | Rotates to the next account |
 | **Codex Auto-Switch** | Turns codex-auth's automatic switching on or off |
 | **Setup…** / **Settings…** (⌘,) | The first-run window / all options, including Open at Login |
+| **⚠︎ Repair Code Sessions…** | Only shown when Claude cannot save Code sessions (see above). Quits Claude, repairs, reopens |
 | **Refresh** | Re-reads accounts and usage (also happens every minute — see Settings — and when you open the menu) |
 
 Each account line shows quota: Claude shows how much you have **used**, Codex how much is
@@ -151,7 +159,8 @@ Each account line shows quota: Claude shows how much you have **used**, Codex ho
 | `~/Applications/Account Switcher.app` | The app (`/Applications` when installed from the DMG) |
 | `~/Library/Application Support/Claude` | The desktop account that is active now |
 | `~/Library/Application Support/Claude-Profile-<name>` | A parked desktop account |
-| `~/Library/Application Support/Account Switcher/conflicts` | Copies set aside when merging shared Code sessions (nothing is deleted) |
+| `~/Library/Application Support/Account Switcher/conflicts` | Copies set aside when syncing shared Code sessions (nothing is deleted) |
+| `~/Library/Application Support/Account Switcher/session-sync.json` | Which sessions each account had at the last switch, to carry deletions over |
 | `~/.local/share/account-switcher/README.md` | This guide (menu → Help; opens this page online when missing) |
 
 ## Uninstall
@@ -205,7 +214,8 @@ ACCOUNT_SWITCHER_ROOT="$T" ~/Applications/"Account Switcher.app"/Contents/MacOS/
 # add  -shareCodeSessions NO  to run the same swap without session sharing
 ```
 
-`--dump` prints what the menu would show; `--setup` and `--settings` open those windows at launch.
+`--sync-sessions` repairs and syncs the Code session folders now (it quits and reopens Claude;
+add `--force` to leave Claude running). `--dump` prints what the menu would show; `--setup` and `--settings` open those windows at launch.
 `ACCOUNT_SWITCHER_PATH=/usr/bin:/bin` (plus an empty `ACCOUNT_SWITCHER_ROOT`) shows the setup
 window as it looks on a Mac without the helpers.
 

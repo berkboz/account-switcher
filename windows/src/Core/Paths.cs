@@ -43,6 +43,8 @@ public static class Paths
 
     public static string ConflictsDir => Path.Combine(AppDir, "conflicts");
     public static string SettingsFile => Path.Combine(AppDir, "settings.json");
+    /// Which sessions each account's folder had at the last switch, to carry deletions over.
+    public static string SessionManifest => Path.Combine(AppDir, "session-sync.json");
 
     public static string ClaudeHome =>
         Env("ACCOUNT_SWITCHER_CLAUDE_HOME") ?? Env("CLAUDE_CONFIG_DIR") ?? Path.Combine(Home, ".claude");

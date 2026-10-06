@@ -60,6 +60,28 @@ public static class FileOps
         }
     }
 
+    /// Writes `text` to `path` through a temporary file and one rename.
+    public static void WriteAtomic(string path, string text)
+    {
+        var tmp = path + ".as-tmp-" + Guid.NewGuid().ToString()[..8];
+        File.WriteAllText(tmp, text);
+        File.Move(tmp, path, overwrite: true);
+    }
+
+    /// Replaces `dst` with a copy of `src` in one rename, keeping `src`'s modification time (which
+    /// decides the newest copy next time). A copy, not a hard link: Claude refuses to write a file
+    /// that has more than one link.
+    public static void CopyReplacing(string src, string dst)
+    {
+        var tmp = dst + ".as-tmp-" + Guid.NewGuid().ToString()[..8];
+        File.Copy(src, tmp);
+        File.SetLastWriteTimeUtc(tmp, File.GetLastWriteTimeUtc(src));
+        File.Move(tmp, dst, overwrite: true);
+    }
+
+    public static bool SameContent(string a, string b) =>
+        new FileInfo(a).Length == new FileInfo(b).Length && File.ReadAllBytes(a).AsSpan().SequenceEqual(File.ReadAllBytes(b));
+
     /// Moves `path` into the conflicts folder under a name that cannot clash.
     public static void SetAside(string path)
     {

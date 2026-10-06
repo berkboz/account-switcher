@@ -1,6 +1,6 @@
 // Runs the Core logic against scratch folders (ACCOUNT_SWITCHER_ROOT), never the real Claude data.
 // `dotnet run --project tests/CoreTests` — exits non-zero on the first failure. CI runs this on
-// windows-latest, where session links are real directory junctions.
+// windows-latest, where the 1.1.0 session links being migrated are real directory junctions.
 using System.Text.Json.Nodes;
 using AccountSwitcher.Core;
 
@@ -76,11 +76,11 @@ Console.WriteLine("Swap with shared Code sessions");
 
     Check(DesktopProfiles.Swap(Named("Work"), host, shareSessions: true) == null, "swap to Work succeeds");
     var active = Path.Combine(root, "Claude");
-    var all = Path.Combine(active, "claude-code-sessions", DesktopProfiles.CommonSessions);
-    var seenByWork = Directory.GetFiles(Path.Combine(active, "claude-code-sessions", "acctB", "orgB"))
-                              .Select(Path.GetFileName).ToHashSet();
+    var all = Path.Combine(active, "claude-code-sessions", "acctB", "orgB");
+    var seenByWork = Directory.GetFiles(all).Select(Path.GetFileName).ToHashSet();
     Check(seenByWork.Contains("local_s1.json") && seenByWork.Contains("local_s2.json"), "Work sees both sessions");
-    Check(FileOps.IsLink(Path.Combine(active, "claude-code-sessions", "acctA", "orgA")), "acctA/orgA is a link");
+    Check(!FileOps.IsLink(Path.Combine(active, "claude-code-sessions", "acctA", "orgA")) &&
+          !FileOps.IsLink(all), "session folders are real folders, not links (Claude cannot save into links)");
     Check(!FileOps.IsLink(Path.Combine(active, "claude-code-sessions")), "sessions folder is a real folder");
     Check(!FileOps.IsLink(Path.Combine(active, "scratch-workspaces")), "scratch folder is a real folder");
     Check(File.ReadAllText(Path.Combine(active, "scratch-workspaces", "acctA", "orgA", "ws1", "f")) == "work",
@@ -90,8 +90,8 @@ Console.WriteLine("Swap with shared Code sessions");
     Check(tasks["scheduledTasks"]!.AsArray().Count == 1, "scheduled task survived the merge");
     var archived = JsonNode.Parse(File.ReadAllText(Path.Combine(all, "archived-sessions.idx")))!["archived"]!.AsArray();
     Check(archived.Count == 2, "archived lists were unioned");
-    Check(Directory.Exists(Paths.ConflictsDir) && Directory.GetFileSystemEntries(Paths.ConflictsDir).Length == 2,
-          "both replaced state files were set aside, not deleted");
+    Check(File.ReadAllText(Path.Combine(active, "claude-code-sessions", "acctA", "orgA", "scheduled-tasks.json")) ==
+          File.ReadAllText(Path.Combine(all, "scheduled-tasks.json")), "both accounts hold the same merged state file");
 
     Write(Path.Combine(active, "claude-code-sessions", "acctB", "orgB", "local_s3.json"), """{"sessionId":"s3"}""");
     Check(DesktopProfiles.Swap(Named("Main"), host, true) == null, "swap back to Main succeeds");
@@ -104,6 +104,64 @@ Console.WriteLine("Swap with shared Code sessions");
     Check(DesktopProfiles.Swap(Named("Work"), host, true) == null && DesktopProfiles.Swap(Named("Main"), host, true) == null,
           "repeated swaps are idempotent");
     Check(Directory.GetFiles(all, "local_*").Length == 3, "still exactly three sessions");
+    Cleanup(root);
+}
+
+Console.WriteLine("Migrating the 1.1.0 linked layout");
+{
+    var root = NewRoot();
+    var sessions = Path.Combine(root, "Claude", "claude-code-sessions");
+    var common = Path.Combine(sessions, DesktopProfiles.CommonSessions);
+    Write(Path.Combine(common, "local_old.json"), """{"sessionId":"old"}""");
+    Directory.CreateDirectory(Path.Combine(sessions, "acctA"));
+    Directory.CreateDirectory(Path.Combine(sessions, "acctB"));
+    var a = Path.Combine(sessions, "acctA", "orgA");
+    var b = Path.Combine(sessions, "acctB", "orgB");
+    FileOps.CreateDirLink(a, common);
+    FileOps.CreateDirLink(b, common);
+    Check(DesktopProfiles.SessionsNeedRepair(), "linked layout is detected");
+    Check(DesktopProfiles.RepairSessions(host) == null, "repair succeeds");
+    Check(!FileOps.IsLink(a) && !FileOps.IsLink(b), "links replaced by real folders");
+    Check(File.Exists(Path.Combine(a, "local_old.json")) && File.Exists(Path.Combine(b, "local_old.json")),
+          "both accounts keep the session");
+    Check(!Directory.Exists(common) && Directory.GetFileSystemEntries(Paths.ConflictsDir).Length == 1,
+          "old shared folder set aside, not deleted");
+    Check(!DesktopProfiles.SessionsNeedRepair(), "nothing left to repair");
+
+    Console.WriteLine("Updates, deletions, new accounts");
+    Write(Path.Combine(a, "local_old.json"), """{"sessionId":"old","v":2}""");
+    File.SetLastWriteTimeUtc(Path.Combine(a, "local_old.json"), DateTime.UtcNow.AddMinutes(1));
+    Write(Path.Combine(a, "local_new.json"), """{"sessionId":"new"}""");
+    DesktopProfiles.SyncSessions(Path.Combine(root, "Claude"));
+    Check(File.ReadAllText(Path.Combine(b, "local_old.json")).Contains("\"v\":2"), "newest copy wins");
+    Check(File.Exists(Path.Combine(b, "local_new.json")), "new session copied to the other account");
+    File.Delete(Path.Combine(b, "local_new.json"));
+    DesktopProfiles.SyncSessions(Path.Combine(root, "Claude"));
+    Check(!File.Exists(Path.Combine(a, "local_new.json")), "session deleted on one account is removed from the other");
+    Check(Directory.GetFiles(Paths.ConflictsDir, "local_new.json.*").Length == 1, "…and set aside, not deleted");
+    var c = Path.Combine(sessions, "acctC", "orgC");
+    Write(Path.Combine(c, "local_c.json"), """{"sessionId":"c"}""");
+    DesktopProfiles.SyncSessions(Path.Combine(root, "Claude"));
+    Check(File.Exists(Path.Combine(c, "local_old.json")) && File.Exists(Path.Combine(a, "local_c.json")),
+          "a new account's folder joins the shared sessions");
+    var stamp = File.GetLastWriteTimeUtc(Path.Combine(c, "local_old.json"));
+    DesktopProfiles.SyncSessions(Path.Combine(root, "Claude"));
+    Check(File.GetLastWriteTimeUtc(Path.Combine(c, "local_old.json")) == stamp, "a sync with nothing new changes nothing");
+    Cleanup(root);
+}
+
+Console.WriteLine("Sharing off still repairs links");
+{
+    var root = NewRoot();
+    var sessions = Path.Combine(root, "Claude-Profile-Work", "claude-code-sessions");
+    var common = Path.Combine(sessions, DesktopProfiles.CommonSessions);
+    Write(Path.Combine(common, "local_w.json"), "{}");
+    Directory.CreateDirectory(Path.Combine(sessions, "acctW"));
+    FileOps.CreateDirLink(Path.Combine(sessions, "acctW", "orgW"), common);
+    Write(Path.Combine(root, "Claude", "file"), "main");
+    Check(DesktopProfiles.Swap(Named("Work"), host, shareSessions: false) == null, "swap to Work succeeds");
+    var w = Path.Combine(root, "Claude", "claude-code-sessions", "acctW", "orgW");
+    Check(!FileOps.IsLink(w) && File.Exists(Path.Combine(w, "local_w.json")), "Work's linked folder became a real one");
     Cleanup(root);
 }
 

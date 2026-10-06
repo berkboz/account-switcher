@@ -31,7 +31,7 @@ window installs them when those are present.
 | | |
 |---|---|
 | **Claude Desktop** | Quits Claude, renames `%APPDATA%\Claude` to `Claude-Profile-<name>`, moves the other account's folder into place, reopens Claude. The Microsoft Store build's virtualized folder is detected automatically. If Claude keeps running in the tray after its window closes, you are asked before it is ended. |
-| **Shared Code sessions** | Session and scratch folders move with the active account, so their path never changes. Per-account session folders are **directory junctions** to one common folder — junctions need no admin rights or Developer Mode. |
+| **Shared Code sessions** | Session and scratch folders move with the active account, so their path never changes. Each account keeps a real session folder and every switch copies each session's newest version into all of them; deletions carry over. No junctions: Claude refuses to save into a linked folder. Updating from 1.1.0, which used junctions, shows **⚠ Repair Code Sessions…** in the menu until the next switch fixes it. |
 | **Claude Code (terminal)** | [claude-swap](https://github.com/realiti4/claude-swap) (`cswap`). On Windows Claude Code keeps its login in `%USERPROFILE%\.claude\.credentials.json`, so switches apply immediately. |
 | **Codex** | [codex-auth](https://github.com/loongphy/codex-auth). After a switch the app offers to restart the Codex app, which only reads its login at startup. |
 | **Settings** | `%APPDATA%\Account Switcher\settings.json`. Open at sign-in uses `HKCU\…\Run`. |
