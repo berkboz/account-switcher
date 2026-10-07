@@ -32,6 +32,21 @@ struct Account {
     let email: String
     let detail: String
     let active: Bool
+    var org: String? = nil  // Claude organization UUID, matches a Desktop profile's
+    var usage: Usage? = nil
+}
+
+/// Share of a Claude account's rate limits used, 0–100, as of `at`.
+struct Usage {
+    let fiveHour: Double, week: Double, at: Date
+
+    /// What is known now: a window that has fully passed since `at` has reset.
+    var current: (fiveHour: Double, week: Double) {
+        let age = Date().timeIntervalSince(at)
+        return (age > 5 * 3600 ? 0 : fiveHour, age > 7 * 86400 ? 0 : week)
+    }
+    var peak: Double { max(current.fiveHour, current.week) }
+    var label: String { "used  5h \(Int(current.fiveHour.rounded()))% · 7d \(Int(current.week.rounded()))%" }
 }
 
 struct Profile {
@@ -495,6 +510,83 @@ func repairSessions(force: Bool = false) -> String? {
     return nil
 }
 
+// MARK: - Claude quota
+
+/// The Claude organization a Desktop data folder is signed in to. Claude names per-org keys in
+/// config.json after it and tags its usage samples with it.
+func desktopOrg(_ dir: String) -> String? {
+    let uuid = #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"#
+    if let config = try? String(contentsOfFile: "\(dir)/config.json", encoding: .utf8),
+       let r = config.range(of: #"dxt:allowlist[A-Za-z]*:"# + uuid, options: .regularExpression) {
+        return String(config[r].suffix(36))
+    }
+    return desktopUsageSample(dir)?.org
+}
+
+/// Claude Desktop records the plan usage it shows in plan-usage-history.json: samples of
+/// {t: ms, org, u: {fh: 5-hour %, sd: 7-day %}}, roughly every 15 minutes while it is in use.
+func desktopUsageSample(_ dir: String) -> (org: String, usage: Usage)? {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: "\(dir)/plan-usage-history.json")),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let last = (json["samples"] as? [[String: Any]])?.last,
+          let t = last["t"] as? Double, let org = last["org"] as? String,
+          let u = last["u"] as? [String: Any] else { return nil }
+    return (org, Usage(fiveHour: (u["fh"] as? Double) ?? 0, week: (u["sd"] as? Double) ?? 0,
+                       at: Date(timeIntervalSince1970: t / 1000)))
+}
+
+/// The newest usage known for a Desktop account: Claude's own sample or, usually fresher,
+/// cswap's for the terminal account in the same organization.
+func desktopUsage(_ dir: String, claude: [Account]) -> Usage? {
+    let org = desktopOrg(dir)
+    let own = desktopUsageSample(dir).flatMap { $0.org == org ? $0.usage : nil }
+    let viaCswap = claude.first { $0.org != nil && $0.org == org }?.usage
+    return [own, viaCswap].compactMap { $0 }.max { $0.at < $1.at }
+}
+
+/// Claude Code Auto-Switch: claude-swap's own `cswap auto` loop, kept running by launchd.
+enum ClaudeAuto {
+    static let label = "io.berk.account-switcher.claude-auto"
+    static var plist: String { "\(home)/Library/LaunchAgents/\(label).plist" }
+    static var log: String { "\(home)/Library/Logs/Account Switcher/claude-auto.log" }
+    static var domain: String { "gui/\(getuid())" }
+
+    static var on: Bool { FileManager.default.fileExists(atPath: plist) }
+
+    /// Writes cswap's threshold, then (re)starts or stops the agent. Returns an error message.
+    static func set(_ enable: Bool, threshold: Int) -> String? {
+        run(args: ["launchctl", "bootout", "\(domain)/\(label)"])
+        guard enable else {
+            try? FileManager.default.removeItem(atPath: plist)
+            return nil
+        }
+        let cswap = run("command -v cswap").output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cswap.isEmpty else { return "claude-swap (cswap) is not installed" }
+        let config = run(args: ["cswap", "config", "set", "autoswitch.threshold", "\(threshold)"])
+        guard config.ok else { return "Could not set the threshold: \(config.output.suffix(120))" }
+        let agent: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": [cswap, "auto"],
+            "EnvironmentVariables": ["PATH": shellPath, "NO_COLOR": "1"],
+            "RunAtLoad": true, "KeepAlive": true, "ThrottleInterval": 60, "ProcessType": "Background",
+            "StandardOutPath": log, "StandardErrorPath": log,
+        ]
+        do {
+            let fm = FileManager.default
+            try fm.createDirectory(atPath: (plist as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            try fm.createDirectory(atPath: (log as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            try PropertyListSerialization.data(fromPropertyList: agent, format: .xml, options: 0)
+                .write(to: URL(fileURLWithPath: plist), options: .atomic)
+        } catch { return "Could not write \(plist): \(error.localizedDescription)" }
+        let r = run(args: ["launchctl", "bootstrap", domain, plist])
+        if !r.ok {
+            try? FileManager.default.removeItem(atPath: plist)
+            return "Could not start it: \(r.output.suffix(120))"
+        }
+        return nil
+    }
+}
+
 // MARK: - CLI-backed accounts
 
 func pct(_ v: Any?) -> String {
@@ -506,14 +598,26 @@ func loadClaudeAccounts() -> [Account] {
     let out = run("cswap list --json 2>/dev/null", timeout: 30).output
     guard let json = try? JSONSerialization.jsonObject(with: Data(out.utf8)) as? [String: Any],
           let accounts = json["accounts"] as? [[String: Any]] else { return [] }
+    let iso = ISO8601DateFormatter()
     return accounts.map { a in
         let usage = a["usage"] as? [String: Any]
         let five = (usage?["fiveHour"] as? [String: Any])?["pct"]
         let week = (usage?["sevenDay"] as? [String: Any])?["pct"]
+        // The newest numbers cswap has, even when its last fetch failed (e.g. an expired token).
+        var known: Usage?
+        for (u, at) in [(usage, a["usageFetchedAt"]), (a["lastGoodUsage"] as? [String: Any], a["lastGoodFetchedAt"])] {
+            guard let u, let at = (at as? String).flatMap({ iso.date(from: $0) }) else { continue }
+            let f = ((u["fiveHour"] as? [String: Any])?["pct"] as? Double) ?? 0
+            let w = ((u["sevenDay"] as? [String: Any])?["pct"] as? Double) ?? 0
+            known = Usage(fiveHour: f, week: w, at: at)
+            break
+        }
         return Account(id: "\(a["number"] ?? "")",
                        email: a["email"] as? String ?? "?",
                        detail: "used  5h \(pct(five)) · 7d \(pct(week))",
-                       active: a["active"] as? Bool ?? false)
+                       active: a["active"] as? Bool ?? false,
+                       org: a["organizationUuid"] as? String,
+                       usage: known)
     }
 }
 
@@ -566,6 +670,7 @@ enum Prefs {
             "refreshSeconds": 60, "menuIcon": "person.2.circle.fill",
             "shareCodeSessions": true, "confirmDesktopSwitch": true,
             "codexRestart": CodexRestart.ask.rawValue, "notifyCodexBackgroundSwitch": true,
+            "claudeThreshold": 90, "warnDesktopQuota": true, "notifyClaudeBackgroundSwitch": true,
         ])
     }
 
@@ -578,6 +683,11 @@ enum Prefs {
     static var confirmDesktopSwitch: Bool { d.bool(forKey: "confirmDesktopSwitch") }
     static var codexRestart: CodexRestart { CodexRestart(rawValue: d.integer(forKey: "codexRestart")) ?? .ask }
     static var notifyCodexBackgroundSwitch: Bool { d.bool(forKey: "notifyCodexBackgroundSwitch") }
+    static let claudeThresholds = [80, 85, 90, 95]
+    /// Share of a Claude account's 5-hour or weekly limit used before switching (or offering to).
+    static var claudeThreshold: Int { d.integer(forKey: "claudeThreshold") }
+    static var warnDesktopQuota: Bool { d.bool(forKey: "warnDesktopQuota") }
+    static var notifyClaudeBackgroundSwitch: Bool { d.bool(forKey: "notifyClaudeBackgroundSwitch") }
 }
 
 /// codex-auth's auto-switch state, e.g. "auto-switch: ON" / "thresholds: 5h<10%, weekly<5%".
@@ -599,7 +709,8 @@ final class SettingsController: NSObject, NSWindowDelegate {
     var window: NSWindow?
     let onChange: () -> Void
     // Controls that are re-read or re-synced; everything else writes straight to Prefs.
-    var loginBox, autoBox: NSButton!
+    var loginBox, autoBox, claudeAutoBox: NSButton!
+    var claudeThresholdPopup: NSPopUpButton!
     var fiveHourPopup, weeklyPopup: NSPopUpButton!
     var prefBoxes: [NSButton] = []      // also changed from the setup window, so re-read on show
     let fiveHourChoices = [5, 10, 15, 20, 25, 30], weeklyChoices = [2, 5, 10, 15, 20]
@@ -663,6 +774,11 @@ final class SettingsController: NSObject, NSWindowDelegate {
         loginBox = NSButton(checkboxWithTitle: "Open at login", target: self, action: #selector(toggleLogin))
         autoBox = NSButton(checkboxWithTitle: "Auto-Switch when an account is nearly out of quota",
                            target: self, action: #selector(toggleAuto))
+        claudeAutoBox = NSButton(checkboxWithTitle: "Auto-Switch when an account is nearly out of quota",
+                                 target: self, action: #selector(toggleClaudeAuto))
+        claudeThresholdPopup = popup(Prefs.claudeThresholds.map { "\($0)%" },
+                                     selected: Prefs.claudeThresholds.firstIndex(of: Prefs.claudeThreshold) ?? 2,
+                                     action: #selector(claudeThresholdChanged))
         fiveHourPopup = popup(fiveHourChoices.map { "\($0)%" }, selected: 1, action: #selector(thresholdChanged))
         weeklyPopup = popup(weeklyChoices.map { "\($0)%" }, selected: 1, action: #selector(thresholdChanged))
         let refresh = popup(["30 seconds", "1 minute", "5 minutes"],
@@ -691,6 +807,15 @@ final class SettingsController: NSObject, NSWindowDelegate {
             check("Share Code sessions across accounts", key: "shareCodeSessions",
                   note: "Every account sees the same Code sessions, like Codex chats. Applied at the next switch. Turning it off stops new sharing; sessions already shared stay in the shared list."),
             check("Ask before quitting Claude to switch", key: "confirmDesktopSwitch"),
+            check("Offer to switch when the account is nearly out of quota", key: "warnDesktopQuota",
+                  note: "Asks once, when the 5-hour or weekly limit reaches the threshold below and another account has room. Claude is never quit without asking."),
+
+            heading("Claude Code (Terminal)"),
+            withNote(claudeAutoBox, "Handled by claude-swap (cswap auto), kept running in the background. It moves to the account with the most quota left, and also undoes a manual switch to an account at or above the threshold."),
+            check("Notify when Auto-Switch changes the account in the background",
+                  key: "notifyClaudeBackgroundSwitch"),
+            withNote(row("Switch when 5-hour or weekly usage reaches", claudeThresholdPopup),
+                     "Also used for the Claude Desktop offer above."),
 
             heading("Codex"),
             withNote(row("Restart the Codex app after a switch:", restart),
@@ -727,10 +852,14 @@ final class SettingsController: NSObject, NSWindowDelegate {
     func sync() {
         for b in prefBoxes { b.state = Prefs.d.bool(forKey: b.identifier?.rawValue ?? "") ? .on : .off }
         loginBox.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        claudeAutoBox.state = ClaudeAuto.on ? .on : .off
+        claudeAutoBox.isEnabled = false
+        claudeThresholdPopup.selectItem(at: Prefs.claudeThresholds.firstIndex(of: Prefs.claudeThreshold) ?? 2)
         [autoBox, fiveHourPopup, weeklyPopup].forEach { $0?.isEnabled = false }
         DispatchQueue.global().async {
-            let installed = hasCommand("codex-auth"), auto = CodexAuto.load()
+            let installed = hasCommand("codex-auth"), auto = CodexAuto.load(), cswap = hasCommand("cswap")
             DispatchQueue.main.async {
+                self.claudeAutoBox.isEnabled = cswap
                 self.autoBox.state = auto.on ? .on : .off
                 self.fiveHourPopup.selectItem(at: self.fiveHourChoices.firstIndex(of: auto.fiveHour) ?? 1)
                 self.weeklyPopup.selectItem(at: self.weeklyChoices.firstIndex(of: auto.weekly) ?? 1)
@@ -787,6 +916,23 @@ final class SettingsController: NSObject, NSWindowDelegate {
         codexConfig([autoBox.state == .on ? "enable" : "disable"], failure: "Could not change Auto-Switch")
     }
 
+    /// Starts, stops or restarts the cswap auto agent off the main thread.
+    func applyClaudeAuto(_ enable: Bool) {
+        claudeAutoBox.isEnabled = false
+        let threshold = Prefs.claudeThreshold
+        DispatchQueue.global().async {
+            if let err = ClaudeAuto.set(enable, threshold: threshold) { notify("Claude Code", err) }
+            DispatchQueue.main.async { self.sync(); self.onChange() }
+        }
+    }
+
+    @objc func toggleClaudeAuto() { applyClaudeAuto(claudeAutoBox.state == .on) }
+
+    @objc func claudeThresholdChanged() {
+        Prefs.d.set(Prefs.claudeThresholds[claudeThresholdPopup.indexOfSelectedItem], forKey: "claudeThreshold")
+        if ClaudeAuto.on { applyClaudeAuto(true) } else { onChange() }
+    }
+
     @objc func thresholdChanged() {
         codexConfig(["--5h", "\(fiveHourChoices[fiveHourPopup.indexOfSelectedItem])",
                      "--weekly", "\(weeklyChoices[weeklyPopup.indexOfSelectedItem])"],
@@ -805,6 +951,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var codexAuto = false
     var busy = false
     var lastCodexActive: String?    // to notice switches made by codex-auth's background daemon
+    var lastClaudeActive: String?   // …and by cswap auto
+    var claudeAuto = false
+    var desktopUsages: [String: Usage] = [:]   // by profile folder
+    var offeredFor: Set<String> = []           // Desktop profile names already offered a switch
     var timer: Timer?
     lazy var settings = SettingsController { [weak self] in self?.applySettings() }
     lazy var onboarding: OnboardingController = {
@@ -845,9 +995,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func refresh() {
         DispatchQueue.global().async {
             let p = loadProfiles(), c = loadClaudeAccounts(), x = loadCodexAccounts(), a = CodexAuto.load().on
+            let u = Dictionary(uniqueKeysWithValues: p.compactMap { pr in desktopUsage(pr.dir, claude: c).map { (pr.dir, $0) } })
+            let ca = ClaudeAuto.on
             DispatchQueue.main.async {
                 self.profiles = p; self.claude = c; self.codex = x; self.codexAuto = a
+                self.desktopUsages = u; self.claudeAuto = ca
                 self.noticeBackgroundCodexSwitch()
+                self.noticeBackgroundClaudeSwitch()
+                self.offerDesktopSwitchIfNeeded()
                 self.rebuild()
             }
         }
@@ -901,6 +1056,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if Prefs.showClaudeCode {
             section("Claude Code (Terminal)", claude, tool: "claude", nextKey: "l")
+            let auto = add("Claude Code Auto-Switch", #selector(toggleClaudeAuto), enabled: claude.count > 1 && !busy)
+            auto.state = claudeAuto ? .on : .off
+            auto.toolTip = "claude-swap moves you to the account with the most quota left when the current one reaches \(Prefs.claudeThreshold)% of its 5-hour or weekly limit. It also undoes manual switches to an account above that."
             menu.addItem(.separator())
         }
         if Prefs.showCodex {
@@ -923,7 +1081,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for p in profiles {
             let mi = add(p.name, #selector(switchDesktop(_:)), object: p.dir, enabled: !busy)
             mi.state = p.active ? .on : .off
-            twoLine(mi, p.name, p.active ? "signed in now" : "click to quit Claude and reopen as this account")
+            let state = p.active ? "signed in now" : "click to quit Claude and reopen as this account"
+            twoLine(mi, p.name, desktopUsages[p.dir].map { "\($0.label) · \(state)" } ?? state)
         }
         _ = add("Next Claude Desktop Account", #selector(nextDesktop), key: "d",
                 enabled: profiles.count > 1 && !busy)
@@ -1134,6 +1293,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc func toggleClaudeAuto() {
+        busy = true
+        rebuild()
+        let enable = !claudeAuto, threshold = Prefs.claudeThreshold
+        DispatchQueue.global().async {
+            if let err = ClaudeAuto.set(enable, threshold: threshold) { notify("Claude Code", err) }
+            DispatchQueue.main.async { self.busy = false; self.refresh() }
+        }
+    }
+
+    /// cswap auto changes the terminal account behind our back; say so. Running terminal sessions
+    /// keep the old login until restarted.
+    func noticeBackgroundClaudeSwitch() {
+        let now = claude.first(where: { $0.active })?.email
+        defer { lastClaudeActive = now }
+        guard claudeAuto, Prefs.notifyClaudeBackgroundSwitch, !busy, let before = lastClaudeActive, let now,
+              now != before else { return }
+        notify("Claude Code", "Auto-Switch moved you from \(before) to \(now). Restart running terminal sessions to use it.")
+    }
+
+    /// When the active Desktop account reaches the threshold and another one has room, offer the
+    /// switch once (again only after its usage has dropped back). Never quits Claude by itself.
+    func offerDesktopSwitchIfNeeded() {
+        guard Prefs.warnDesktopQuota, Prefs.showDesktop, !busy, profiles.count > 1,
+              let active = profiles.first(where: { $0.active }), let used = desktopUsages[active.dir] else { return }
+        let limit = Double(Prefs.claudeThreshold)
+        if used.peak < limit - 10 { offeredFor.remove(active.name) }
+        guard used.peak >= limit, !offeredFor.contains(active.name) else { return }
+        let roomy = profiles.filter { !$0.active }
+            .compactMap { p in desktopUsages[p.dir].map { (p, $0.peak) } }
+            .filter { $0.1 < limit }.min { $0.1 < $1.1 }
+        guard let (target, targetPeak) = roomy else { return }
+        offeredFor.insert(active.name)
+        let c = used.current
+        let window = c.fiveHour >= c.week ? "5-hour" : "weekly"
+        notify("Claude Desktop", "\(active.name) has used \(Int(used.peak.rounded()))% of its \(window) limit.")
+        // Via the run loop: a modal alert inside this refresh would hold up the main queue.
+        RunLoop.main.perform {
+            guard self.confirm("\(active.name) is nearly out of quota",
+                               "It has used \(Int(used.peak.rounded()))% of its \(window) limit. \(target.name) has used \(Int(targetPeak.rounded()))%. Claude will quit and reopen as \(target.name); running chats and Code sessions stop, and are still there afterwards.",
+                               "Switch to \(target.name)") else { return }
+            self.busy = true
+            self.rebuild()
+            DispatchQueue.global().async {
+                let err = swapDesktop(to: target)
+                notify("Claude Desktop", err ?? "Switched to \(target.name)")
+                DispatchQueue.main.async { self.busy = false; self.refresh() }
+            }
+        }
+    }
+
     @objc func toggleCodexAuto() {
         busy = true
         rebuild()
@@ -1163,8 +1373,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 Prefs.register()
 
 if CommandLine.arguments.contains("--dump") {
-    loadProfiles().forEach { print("Desktop", $0.active ? "*" : " ", $0.name, "|", $0.dir) }
-    loadClaudeAccounts().forEach { print("Claude ", $0.active ? "*" : " ", $0.email, "|", $0.detail) }
+    let claudeAccounts = loadClaudeAccounts()
+    loadProfiles().forEach {
+        print("Desktop", $0.active ? "*" : " ", $0.name, "|", desktopOrg($0.dir) ?? "?", "|",
+              desktopUsage($0.dir, claude: claudeAccounts).map { "\($0.label) as of \($0.at)" } ?? "usage unknown")
+    }
+    claudeAccounts.forEach { print("Claude ", $0.active ? "*" : " ", $0.email, "|", $0.detail) }
+    print("Claude Code auto-switch:", ClaudeAuto.on ? "on" : "off", "at", Prefs.claudeThreshold, "%")
     loadCodexAccounts().forEach { print("Codex  ", $0.active ? "*" : " ", $0.email, "|", $0.detail) }
     print("Codex auto-switch:", CodexAuto.load().on ? "on" : "off")
     exit(0)

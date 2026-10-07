@@ -65,7 +65,13 @@ changes Claude Code **inside the desktop app**.
 3. Claude quits and reopens on its sign-in screen. Sign in with the new account.
 
 After that, click an account under **Claude Desktop** (or **Next Claude Desktop Account**, ⌘D)
-to switch.
+to switch. Each account shows how much of its 5-hour and weekly limits it has used.
+
+**Nearly out of quota?** When the active account reaches the threshold (90% by default, in
+Settings) of its 5-hour or weekly limit and another account still has room, Account Switcher asks
+once whether to switch to it. It never quits Claude without asking. Usage comes from Claude
+Desktop's own records and, fresher, from claude-swap for the terminal account in the same
+organization, so set up Claude Code below too for the best numbers.
 
 **Code sessions are shared across accounts**, like Codex chats. Hit your limit on one account,
 switch, and continue the same Code session on the other. Regular chats (the Chat tab) stay with
@@ -95,6 +101,13 @@ cswap add           # store it
 ```
 
 Then switch from the menu, or with `cswap switch`.
+
+**Claude Code Auto-Switch** (menu toggle, or Settings) keeps claude-swap's own `cswap auto` running
+in the background (a launchd agent). When the active account reaches the threshold of its 5-hour or
+weekly limit, it moves to the account with the most quota left, and a notification tells you.
+Running terminal sessions keep the old login until restarted. Like Codex Auto-Switch, it also
+undoes a manual switch to an account above the threshold. Its log is
+`~/Library/Logs/Account Switcher/claude-auto.log`.
 
 > **Never run `/logout` or `claude auth logout`.** It can invalidate a stored account's token.
 > To change accounts, switch from the menu instead.
@@ -129,6 +142,7 @@ Two side effects to know:
 | An account under **Claude Desktop** | Quits Claude and reopens it as that account (✓ = current) |
 | An account under **Claude Code** or **Codex** | Switches to it (✓ = current) |
 | **Next … Account** | Rotates to the next account |
+| **Claude Code Auto-Switch** | Turns claude-swap's automatic switching on or off |
 | **Codex Auto-Switch** | Turns codex-auth's automatic switching on or off |
 | **Setup…** / **Settings…** (⌘,) | The first-run window / all options, including Open at Login |
 | **⚠︎ Repair Code Sessions…** | Only shown when Claude cannot save Code sessions (see above). Quits Claude, repairs, reopens |
