@@ -89,7 +89,7 @@ Console.WriteLine("Swap with shared Code sessions");
     var tasks = JsonNode.Parse(File.ReadAllText(Path.Combine(all, "scheduled-tasks.json")))!;
     Check(tasks["scheduledTasks"]!.AsArray().Count == 1, "scheduled task survived the merge");
     var archived = JsonNode.Parse(File.ReadAllText(Path.Combine(all, "archived-sessions.idx")))!["archived"]!.AsArray();
-    Check(archived.Count == 2, "archived lists were unioned");
+    Check(archived.Count == 0, "archive list rebuilt from the sessions (none archived)");
     Check(File.ReadAllText(Path.Combine(active, "claude-code-sessions", "acctA", "orgA", "scheduled-tasks.json")) ==
           File.ReadAllText(Path.Combine(all, "scheduled-tasks.json")), "both accounts hold the same merged state file");
 
@@ -144,6 +144,19 @@ Console.WriteLine("Migrating the 1.1.0 linked layout");
     DesktopProfiles.SyncSessions(Path.Combine(root, "Claude"));
     Check(File.Exists(Path.Combine(c, "local_old.json")) && File.Exists(Path.Combine(a, "local_c.json")),
           "a new account's folder joins the shared sessions");
+    foreach (var dir in new[] { a, b, c })
+        Write(Path.Combine(dir, "archived-sessions.idx"), """{"v":1,"archived":["local_old"]}""");
+    Write(Path.Combine(a, "local_old.json"), """{"sessionId":"old","isArchived":true}""");
+    DesktopProfiles.SyncSessions(Path.Combine(root, "Claude"));
+    Write(Path.Combine(b, "local_old.json"), """{"sessionId":"old","isArchived":false}""");   // unarchived on B
+    File.SetLastWriteTimeUtc(Path.Combine(b, "local_old.json"), DateTime.UtcNow.AddMinutes(5));
+    Write(Path.Combine(b, "archived-sessions.idx"), """{"v":1,"archived":[]}""");
+    Write(Path.Combine(a, "local_c.json"), """{"sessionId":"c","isArchived":true}""");     // archived on A
+    File.SetLastWriteTimeUtc(Path.Combine(a, "local_c.json"), DateTime.UtcNow.AddMinutes(5));
+    DesktopProfiles.SyncSessions(Path.Combine(root, "Claude"));
+    var idx = JsonNode.Parse(File.ReadAllText(Path.Combine(c, "archived-sessions.idx")))!["archived"]!.AsArray()
+                      .Select(n => (string)n!).ToList();
+    Check(idx.SequenceEqual(["local_c"]), "archive list follows the sessions: unarchive and archive both carry over");
     var stamp = File.GetLastWriteTimeUtc(Path.Combine(c, "local_old.json"));
     DesktopProfiles.SyncSessions(Path.Combine(root, "Claude"));
     Check(File.GetLastWriteTimeUtc(Path.Combine(c, "local_old.json")) == stamp, "a sync with nothing new changes nothing");

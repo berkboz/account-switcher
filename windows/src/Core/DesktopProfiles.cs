@@ -43,6 +43,7 @@ public static class DesktopProfiles
 {
     public static readonly string[] SharedFolders = ["claude-code-sessions", "scratch-workspaces"];
     public const string CommonSessions = "_all";
+    public const string ArchiveIndex = "archived-sessions.idx";
 
     public static string ActiveName()
     {
@@ -185,7 +186,7 @@ public static class DesktopProfiles
     }
 
     /// Makes every <account>\<org> session folder hold the same sessions: for each file the newest
-    /// copy wins, small state files (scheduled-tasks.json, archived-sessions.idx) are merged, and a
+    /// copy wins, small state files (scheduled-tasks.json) are merged, the archive list is rebuilt, and a
     /// session deleted in one folder since the last sync is removed from the others (set aside,
     /// never deleted). Subfolders only Claude knows about are left alone.
     public static void SyncSessions(string active)
@@ -211,7 +212,7 @@ public static class DesktopProfiles
             if (previous.TryGetValue(Key(folder), out var before))
                 deleted.UnionWith(before.Where(n => n.StartsWith("local_") && !present[folder].Contains(n)));
 
-        foreach (var name in present.Values.SelectMany(x => x).Distinct().ToList())
+        foreach (var name in present.Values.SelectMany(x => x).Distinct().Where(n => n != ArchiveIndex).ToList())
         {
             var copies = sources.Where(f => present[f].Contains(name)).Select(f => Path.Combine(f, name))
                                 .OrderByDescending(File.GetLastWriteTimeUtc).ToList();
@@ -244,6 +245,26 @@ public static class DesktopProfiles
                 {
                     FileOps.CopyReplacing(newest, d);
                 }
+            }
+        }
+
+        // Claude's archive list is only a loading hint for the isArchived flag inside each session
+        // file. Merging the lists would bring back an archive entry for a session unarchived on the
+        // other account, so rebuild it from the sessions as they are now (identical in every folder).
+        if (folders.Count > 0 && sources.Any(f => present[f].Contains(ArchiveIndex)))
+        {
+            var archived = Directory.EnumerateFiles(folders[0], "local_*.json")
+                .Where(f =>
+                {
+                    try { return JsonNode.Parse(File.ReadAllText(f))?["isArchived"]?.GetValue<bool>() == true; }
+                    catch (Exception e) when (e is JsonException or InvalidOperationException or FormatException) { return false; }
+                })
+                .Select(f => Path.GetFileNameWithoutExtension(f)).OrderBy(n => n, StringComparer.Ordinal);
+            var index = new JsonObject { ["archived"] = new JsonArray(archived.Select(n => (JsonNode)n).ToArray()), ["v"] = 1 }.ToJsonString();
+            foreach (var folder in folders)
+            {
+                var d = Path.Combine(folder, ArchiveIndex);
+                if (!File.Exists(d) || File.ReadAllText(d) != index) FileOps.WriteAtomic(d, index);
             }
         }
 

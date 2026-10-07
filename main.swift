@@ -264,6 +264,7 @@ func carryShared(from parked: String?, to active: String) throws {
 /// What syncSessions saw in each <account>/<org> folder last time, so a session the user deleted
 /// on one account is removed from the others instead of being copied back.
 let sessionManifest = "\(appSupport)/Account Switcher/session-sync.json"
+let archiveIndex = "archived-sessions.idx"
 
 /// The real <account>/<org> session folders under `root`, turning any symlinked one (the 1.1.x
 /// layout) into an empty real folder first.
@@ -301,7 +302,7 @@ func copyReplacing(_ src: String, _ dst: String) throws {
 }
 
 /// Makes every <account>/<org> session folder hold the same sessions: for each file the newest
-/// copy wins, small state files (scheduled-tasks.json, archived-sessions.idx) are merged, and a
+/// copy wins, small state files (scheduled-tasks.json) are merged, the archive list is rebuilt, and a
 /// session deleted in one folder since the last sync is removed from the others (set aside in
 /// `conflictsDir`, never deleted). Folders and files only Claude knows about are left alone.
 func syncSessions(in active: String) throws {
@@ -330,7 +331,7 @@ func syncSessions(in active: String) throws {
         deleted.formUnion(Set(before).subtracting(present[folder] ?? []).filter { $0.hasPrefix("local_") })
     }
 
-    for name in present.values.reduce(Set<String>(), { $0.union($1) }) {
+    for name in present.values.reduce(Set<String>(), { $0.union($1) }) where name != archiveIndex {
         let copies = sources.filter { present[$0]?.contains(name) == true }
             .map { "\($0)/\(name)" }.sorted { modDate($0) > modDate($1) }
         if deleted.contains(name) {
@@ -359,6 +360,24 @@ func syncSessions(in active: String) throws {
                     try fm.setAttributes([.modificationDate: modDate(newest)], ofItemAtPath: d)
                 }
             }
+        }
+    }
+
+    // Claude's archive list is only a loading hint for the isArchived flag inside each session
+    // file. Merging the lists would bring back an archive entry for a session unarchived on the
+    // other account, so rebuild it from the sessions as they are now (identical in every folder).
+    if let first = folders.first, sources.contains(where: { present[$0]?.contains(archiveIndex) == true }) {
+        let archived = ((try? fm.contentsOfDirectory(atPath: first)) ?? [])
+            .filter { $0.hasPrefix("local_") && $0.hasSuffix(".json") }
+            .filter { name in
+                let d = (try? JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: "\(first)/\(name)")))) as? [String: Any]
+                return d?["isArchived"] as? Bool == true
+            }
+            .map { String($0.dropLast(5)) }.sorted()
+        let data = try JSONSerialization.data(withJSONObject: ["v": 1, "archived": archived], options: [.sortedKeys])
+        for folder in folders {
+            let d = "\(folder)/\(archiveIndex)"
+            if (try? Data(contentsOf: URL(fileURLWithPath: d))) != data { try data.write(to: URL(fileURLWithPath: d), options: .atomic) }
         }
     }
 
