@@ -15,7 +15,7 @@ BUILD="$(mktemp -d)"
 trap 'rm -rf "$BUILD"' EXIT
 
 for arch in arm64 x86_64; do
-  swiftc -O -target "$arch-apple-macos13.0" main.swift Onboarding.swift LocalStorage.swift -o "$BUILD/AccountSwitcher-$arch"
+  swiftc -O -target "$arch-apple-macos13.0" main.swift Onboarding.swift -o "$BUILD/AccountSwitcher-$arch"
 done
 
 rm -rf "$APP"

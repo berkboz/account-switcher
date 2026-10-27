@@ -85,8 +85,9 @@ Small state files (scheduled tasks, the archive list) are combined. Anything rep
 this way is moved to `~/Library/Application Support/Account Switcher/conflicts`. Nothing is deleted.
 
 **The Code sidebar layout comes along too**: your groups, sections, which session sits in which
-group, and starred groups. Claude keeps these per account in its Local Storage, so on each switch
-the layout of the account you just left is copied into the one you switch to. The very first time,
+group, pinned and starred sessions, and project order. Claude keeps these per account in
+`claude_desktop_config.json`, so on each switch the layout of the account you just left is copied
+into the one you switch to. The very first time,
 the account with more grouped sessions keeps its layout instead, so an organized sidebar is never
 overwritten by an empty one. The replaced layout is saved in the same `conflicts` folder.
 

@@ -456,76 +456,78 @@ func repairScratchPaths(in active: String) throws {
 
 // MARK: - Shared sidebar layout
 //
-// The Code sidebar's groups, sections and which session sits in which group are not stored with
-// the sessions but in Claude's Local Storage, under a "<account>/<org>" scope, so each account kept
-// its own layout of the same shared sessions. Group assignments name sessions by their shared id
-// ("code:local_…"), so a layout fits any account. On a switch the outgoing account's layout (the
-// one just used) is copied into the incoming account's scope. The very first time, the layout
+// The Code sidebar's groups, sections, pinned and starred sessions and project order are not
+// stored with the sessions but in claude_desktop_config.json under preferences.epitaxyPrefs (Claude
+// copies them into its Local Storage at launch, so that copy is not the one to change). Groups and
+// sections sit under an "<account>/<org>" scope, project order under a key ending in the account
+// id, so each account kept its own layout of the same shared sessions. Everything names sessions
+// by their shared id ("local_…"), so a layout fits any account. On a switch the outgoing account's
+// layout (the one just used) is copied into the incoming one. The very first time, the layout
 // with more grouped sessions wins instead, so an organized account is never overwritten by a bare
 // one. Replaced values are kept in `conflictsDir`.
 
-let sidebarScopedKeys = ["LSS-persisted.dframe-group-scopes", "LSS-persisted.dframe-code-sections"]
-let sidebarPlainKeys = ["LSS-persisted.starred-session-groups"]
-let sidebarMarker = "\(appSupport)/Account Switcher/sidebar-sync.json"
+let sidebarScopedPrefs = ["dframe-group-scopes", "dframe-code-sections"]
+let sidebarAccountPrefs = ["code-projects-order"]
+let sidebarPlainPrefs = ["dframe-local-slice", "starred-local-code-sessions", "starred-session-groups"]
+let sidebarMarker = "\(appSupport)/Account Switcher/sidebar-layout-sync.json"
 
-/// The "<account>/<org>" scope a data folder's sidebar layout is filed under.
-func sidebarScope(_ dir: String) -> String? {
+/// The account and organization a data folder is signed in to, as Claude scopes its prefs.
+func sidebarAccount(_ dir: String) -> (account: String, org: String)? {
     guard let data = try? Data(contentsOf: URL(fileURLWithPath: "\(dir)/config.json")),
           let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let account = (config["bootSideSessions"] as? [String: Any])?["accountUuid"] as? String,
           let org = desktopOrg(dir) else { return nil }
-    return "\(account)/\(org)"
+    return (account, org)
 }
 
-/// Copies the sidebar layout of the data folder `outgoing` into `incoming`. Both must be quit.
+/// Copies the sidebar layout of the data folder `outgoing` into `incoming`. Claude must be quit.
 func syncSidebar(from outgoing: String, to incoming: String) throws {
-    let ldb = "Local Storage/leveldb"
-    guard isDir("\(outgoing)/\(ldb)"), isDir("\(incoming)/\(ldb)"),
-          let from = sidebarScope(outgoing), let to = sidebarScope(incoming), from != to else { return }
-    let names = sidebarScopedKeys + sidebarPlainKeys
-    let src = try LevelDB("\(outgoing)/\(ldb)", keys: Set(names.map(localStorageKey)))
-    var dst = try LevelDB("\(incoming)/\(ldb)", keys: Set(names.map(localStorageKey)))
-
-    /// A stored item: {"value": …, "tabId": …, "timestamp": ms}.
-    func item(_ db: LevelDB, _ name: String) -> [String: Any]? {
-        db.get(localStorageKey(name)).flatMap(localStorageString)
-            .flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
-    }
-    func layout(_ db: LevelDB, _ name: String, _ scope: String) -> Any? {
-        (item(db, name)?["value"] as? [String: Any])?[scope]
-    }
-    func grouped(_ db: LevelDB, _ scope: String) -> Int {
-        ((layout(db, sidebarScopedKeys[0], scope) as? [String: Any])?["assignments"] as? [String: Any])?.count ?? 0
-    }
-    guard layout(src, sidebarScopedKeys[0], from) != nil else { return }
     let fm = FileManager.default
-    let firstSync = !fm.fileExists(atPath: sidebarMarker)
-    if !(firstSync && grouped(dst, to) > grouped(src, from)) {
-        let now = Int(Date().timeIntervalSince1970 * 1000)
-        var writes: [(key: [UInt8], value: [UInt8])] = []
-        for name in names {
-            var new = item(dst, name) ?? ["tabId": ""]
-            if sidebarScopedKeys.contains(name) {
-                guard let value = layout(src, name, from) else { continue }
-                if (layout(dst, name, to) as? NSObject)?.isEqual(value) == true { continue }
-                var scopes = new["value"] as? [String: Any] ?? [:]
-                scopes[to] = value
-                new["value"] = scopes
-            } else {
-                guard let value = item(src, name)?["value"] else { continue }
-                if (new["value"] as? NSObject)?.isEqual(value) == true { continue }
-                new["value"] = value
-            }
-            new["timestamp"] = now
-            if let old = dst.get(localStorageKey(name)).flatMap(localStorageString) {
-                try fm.createDirectory(atPath: conflictsDir, withIntermediateDirectories: true)
-                try old.write(toFile: "\(conflictsDir)/\(name).\(now / 1000)-\(UUID().uuidString.prefix(8)).json",
-                              atomically: true, encoding: .utf8)
-            }
-            let json = try JSONSerialization.data(withJSONObject: new, options: [.withoutEscapingSlashes])
-            writes.append((localStorageKey(name), localStorageBytes(String(decoding: json, as: UTF8.self))))
+    let path = "\(incoming)/claude_desktop_config.json"
+    func load(_ path: String) -> [String: Any]? {
+        (try? Data(contentsOf: URL(fileURLWithPath: path)))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+    }
+    guard let a = sidebarAccount(outgoing), let b = sidebarAccount(incoming), a != b,
+          let src = (load("\(outgoing)/claude_desktop_config.json")?["preferences"] as? [String: Any])?["epitaxyPrefs"] as? [String: Any],
+          var config = load(path) else { return }
+    var prefs = config["preferences"] as? [String: Any] ?? [:]
+    var dst = prefs["epitaxyPrefs"] as? [String: Any] ?? [:]
+    let from = "\(a.account)/\(a.org)", to = "\(b.account)/\(b.org)"
+    func grouped(_ p: [String: Any], _ scope: String) -> Int {
+        (((p["dframe-group-scopes"] as? [String: Any])?[scope] as? [String: Any])?["assignments"] as? [String: Any])?.count ?? 0
+    }
+
+    if fm.fileExists(atPath: sidebarMarker) || grouped(src, from) >= grouped(dst, to) {
+        var changes: [(key: String, scope: String?, value: Any)] = []
+        for k in sidebarScopedPrefs { if let v = (src[k] as? [String: Any])?[from] { changes.append((k, to, v)) } }
+        for k in sidebarAccountPrefs { if let v = src["\(k).\(a.account)"] { changes.append(("\(k).\(b.account)", nil, v)) } }
+        for k in sidebarPlainPrefs { if let v = src[k] { changes.append((k, nil, v)) } }
+
+        var replaced: [String: Any] = [:], changed = false
+        for c in changes {
+            var holder = c.scope.map { _ in dst[c.key] as? [String: Any] ?? [:] } ?? dst
+            let key = c.scope ?? c.key
+            if (holder[key] as? NSObject)?.isEqual(c.value) == true { continue }
+            if let old = holder[key] { replaced[c.scope.map { "\(c.key)/\($0)" } ?? c.key] = old }
+            holder[key] = c.value
+            if c.scope != nil { dst[c.key] = holder } else { dst = holder }
+            changed = true
         }
-        try dst.put(writes)
+        if changed {
+            let stamp = "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(8))"
+            if !replaced.isEmpty {
+                try fm.createDirectory(atPath: conflictsDir, withIntermediateDirectories: true)
+                try JSONSerialization.data(withJSONObject: replaced, options: [.prettyPrinted, .withoutEscapingSlashes])
+                    .write(to: URL(fileURLWithPath: "\(conflictsDir)/sidebar-layout.\(stamp).json"), options: .atomic)
+            }
+            prefs["epitaxyPrefs"] = dst
+            config["preferences"] = prefs
+            let mode = (try? fm.attributesOfItem(atPath: path)[.posixPermissions]) ?? 0o600
+            try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .withoutEscapingSlashes])
+                .write(to: URL(fileURLWithPath: path), options: .atomic)
+            try fm.setAttributes([.posixPermissions: mode], ofItemAtPath: path)
+        }
     }
     try fm.createDirectory(atPath: (sidebarMarker as NSString).deletingLastPathComponent,
                            withIntermediateDirectories: true)
