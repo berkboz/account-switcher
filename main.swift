@@ -454,6 +454,85 @@ func repairScratchPaths(in active: String) throws {
     }
 }
 
+// MARK: - Shared sidebar layout
+//
+// The Code sidebar's groups, sections and which session sits in which group are not stored with
+// the sessions but in Claude's Local Storage, under a "<account>/<org>" scope, so each account kept
+// its own layout of the same shared sessions. Group assignments name sessions by their shared id
+// ("code:local_…"), so a layout fits any account. On a switch the outgoing account's layout (the
+// one just used) is copied into the incoming account's scope. The very first time, the layout
+// with more grouped sessions wins instead, so an organized account is never overwritten by a bare
+// one. Replaced values are kept in `conflictsDir`.
+
+let sidebarScopedKeys = ["LSS-persisted.dframe-group-scopes", "LSS-persisted.dframe-code-sections"]
+let sidebarPlainKeys = ["LSS-persisted.starred-session-groups"]
+let sidebarMarker = "\(appSupport)/Account Switcher/sidebar-sync.json"
+
+/// The "<account>/<org>" scope a data folder's sidebar layout is filed under.
+func sidebarScope(_ dir: String) -> String? {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: "\(dir)/config.json")),
+          let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let account = (config["bootSideSessions"] as? [String: Any])?["accountUuid"] as? String,
+          let org = desktopOrg(dir) else { return nil }
+    return "\(account)/\(org)"
+}
+
+/// Copies the sidebar layout of the data folder `outgoing` into `incoming`. Both must be quit.
+func syncSidebar(from outgoing: String, to incoming: String) throws {
+    let ldb = "Local Storage/leveldb"
+    guard isDir("\(outgoing)/\(ldb)"), isDir("\(incoming)/\(ldb)"),
+          let from = sidebarScope(outgoing), let to = sidebarScope(incoming), from != to else { return }
+    let names = sidebarScopedKeys + sidebarPlainKeys
+    let src = try LevelDB("\(outgoing)/\(ldb)", keys: Set(names.map(localStorageKey)))
+    var dst = try LevelDB("\(incoming)/\(ldb)", keys: Set(names.map(localStorageKey)))
+
+    /// A stored item: {"value": …, "tabId": …, "timestamp": ms}.
+    func item(_ db: LevelDB, _ name: String) -> [String: Any]? {
+        db.get(localStorageKey(name)).flatMap(localStorageString)
+            .flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+    }
+    func layout(_ db: LevelDB, _ name: String, _ scope: String) -> Any? {
+        (item(db, name)?["value"] as? [String: Any])?[scope]
+    }
+    func grouped(_ db: LevelDB, _ scope: String) -> Int {
+        ((layout(db, sidebarScopedKeys[0], scope) as? [String: Any])?["assignments"] as? [String: Any])?.count ?? 0
+    }
+    guard layout(src, sidebarScopedKeys[0], from) != nil else { return }
+    let fm = FileManager.default
+    let firstSync = !fm.fileExists(atPath: sidebarMarker)
+    if !(firstSync && grouped(dst, to) > grouped(src, from)) {
+        let now = Int(Date().timeIntervalSince1970 * 1000)
+        var writes: [(key: [UInt8], value: [UInt8])] = []
+        for name in names {
+            var new = item(dst, name) ?? ["tabId": ""]
+            if sidebarScopedKeys.contains(name) {
+                guard let value = layout(src, name, from) else { continue }
+                if (layout(dst, name, to) as? NSObject)?.isEqual(value) == true { continue }
+                var scopes = new["value"] as? [String: Any] ?? [:]
+                scopes[to] = value
+                new["value"] = scopes
+            } else {
+                guard let value = item(src, name)?["value"] else { continue }
+                if (new["value"] as? NSObject)?.isEqual(value) == true { continue }
+                new["value"] = value
+            }
+            new["timestamp"] = now
+            if let old = dst.get(localStorageKey(name)).flatMap(localStorageString) {
+                try fm.createDirectory(atPath: conflictsDir, withIntermediateDirectories: true)
+                try old.write(toFile: "\(conflictsDir)/\(name).\(now / 1000)-\(UUID().uuidString.prefix(8)).json",
+                              atomically: true, encoding: .utf8)
+            }
+            let json = try JSONSerialization.data(withJSONObject: new, options: [.withoutEscapingSlashes])
+            writes.append((localStorageKey(name), localStorageBytes(String(decoding: json, as: UTF8.self))))
+        }
+        try dst.put(writes)
+    }
+    try fm.createDirectory(atPath: (sidebarMarker as NSString).deletingLastPathComponent,
+                           withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: ["lastSync": Int(Date().timeIntervalSince1970)])
+        .write(to: URL(fileURLWithPath: sidebarMarker), options: .atomic)
+}
+
 /// Quits Claude Desktop, parks the active data folder, activates `target`, reopens Claude.
 /// Returns nil on success or a human-readable error. Every step is undone on failure.
 func swapDesktop(to target: Profile) -> String? {
@@ -505,6 +584,13 @@ func swapDesktop(to target: Profile) -> String? {
         }
     } catch {
         warning = "Switched, but sharing Code sessions failed: \(error.localizedDescription)"
+    }
+    if Prefs.shareCodeSessions && hasActive {
+        do {
+            try syncSidebar(from: parkedCurrent, to: activeDir)
+        } catch {
+            warning = warning ?? "Switched, but carrying the sidebar layout over failed: \(error.localizedDescription)"
+        }
     }
     if !testMode { run(args: ["open", "-b", claudeBundle]) }
     return warning

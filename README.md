@@ -84,6 +84,12 @@ newest version into all of them; a session you delete on one account is removed 
 Small state files (scheduled tasks, the archive list) are combined. Anything replaced or removed
 this way is moved to `~/Library/Application Support/Account Switcher/conflicts`. Nothing is deleted.
 
+**The Code sidebar layout comes along too**: your groups, sections, which session sits in which
+group, and starred groups. Claude keeps these per account in its Local Storage, so on each switch
+the layout of the account you just left is copied into the one you switch to. The very first time,
+the account with more grouped sessions keeps its layout instead, so an organized sidebar is never
+overwritten by an empty one. The replaced layout is saved in the same `conflicts` folder.
+
 > **Updating from 1.1.0?** Claude Desktop 2.19 and later cannot save Code sessions into the
 > linked folder 1.1.0 set up, so sessions started since then disappear when Claude quits. The menu
 > shows **⚠︎ Repair Code Sessions…** until the next switch fixes it; click it to repair right away
