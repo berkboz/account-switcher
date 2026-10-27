@@ -91,6 +91,10 @@ into the one you switch to. The very first time,
 the account with more grouped sessions keeps its layout instead, so an organized sidebar is never
 overwritten by an empty one. The replaced layout is saved in the same `conflicts` folder.
 
+Sessions whose folder was moved and replaced by a symlink are repaired on each switch: their
+path is pointed at the real folder and their transcript moved there, so Claude does not reopen
+them with an old copy of the conversation.
+
 > **Updating from 1.1.0?** Claude Desktop 2.19 and later cannot save Code sessions into the
 > linked folder 1.1.0 set up, so sessions started since then disappear when Claude quits. The menu
 > shows **⚠︎ Repair Code Sessions…** until the next switch fixes it; click it to repair right away

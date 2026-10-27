@@ -454,6 +454,54 @@ func repairScratchPaths(in active: String) throws {
     }
 }
 
+/// `path` with every symlink resolved, as Claude Code resolves a session's cwd.
+func resolvedPath(_ path: String) -> String? {
+    guard let p = realpath(path, nil) else { return nil }
+    defer { free(p) }
+    return String(cString: p)
+}
+
+/// Sessions started in a folder that later became a symlink (a project moved and its old path
+/// linked to the new one) keep the old path as cwd. Claude Code files their transcript under the
+/// resolved path, but Claude Desktop reads it under the cwd, so after a restart it showed a stale
+/// copy left at the old path, or nothing once the link is removed. Points cwd at the real path and
+/// moves the transcript there, leaving a link at the old location. The losing copy of a transcript
+/// both places had is set aside in `conflictsDir`.
+func resolveSessionPaths(in active: String) throws {
+    let fm = FileManager.default
+    let projects = "\(claudeHome)/projects"
+    let sessionFiles = ((try? sessionFolders("\(active)/claude-code-sessions")) ?? []).flatMap { folder in
+        ((try? fm.contentsOfDirectory(atPath: folder)) ?? []).filter { $0.hasSuffix(".json") }.map { "\(folder)/\($0)" }
+    }
+    for path in sessionFiles {
+        guard var d = (try? JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path)))) as? [String: Any],
+              let cwd = d["cwd"] as? String, let real = resolvedPath(cwd), real != cwd else { continue }
+        if let cli = d["cliSessionId"] as? String {
+            let old = "\(projects)/\(projectKey(cwd))/\(cli).jsonl"
+            let new = "\(projects)/\(projectKey(real))/\(cli).jsonl"
+            if old != new && fm.fileExists(atPath: old) && !isSymlink(old) {
+                if !fm.fileExists(atPath: new) {
+                    try fm.createDirectory(atPath: (new as NSString).deletingLastPathComponent,
+                                           withIntermediateDirectories: true)
+                    try fm.moveItem(atPath: old, toPath: new)
+                } else if modDate(old) > modDate(new) {
+                    try setAside(new)
+                    try fm.moveItem(atPath: old, toPath: new)
+                } else {
+                    try setAside(old)
+                }
+                try fm.createSymbolicLink(atPath: old, withDestinationPath: new)
+            }
+        }
+        for key in ["cwd", "originCwd"] {
+            if let v = d[key] as? String, let r = resolvedPath(v) { d[key] = r }
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: d) {
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        }
+    }
+}
+
 // MARK: - Shared sidebar layout
 //
 // The Code sidebar's groups, sections, pinned and starred sessions and project order are not
@@ -584,6 +632,7 @@ func swapDesktop(to target: Profile) -> String? {
             // Sharing is off, but links left by 1.1.x would still stop Claude from saving.
             try syncSessions(in: activeDir)
         }
+        try resolveSessionPaths(in: activeDir)
     } catch {
         warning = "Switched, but sharing Code sessions failed: \(error.localizedDescription)"
     }
@@ -610,6 +659,7 @@ func repairSessions(force: Bool = false) -> String? {
     do {
         try syncSessions(in: activeDir)
         try repairScratchPaths(in: activeDir)
+        try resolveSessionPaths(in: activeDir)
     } catch {
         return "Could not repair Code sessions: \(error.localizedDescription)"
     }
