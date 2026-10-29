@@ -1626,6 +1626,21 @@ if CommandLine.arguments.contains("--dump") {
     exit(0)
 }
 
+// Copies a parked account's sidebar layout into the active one without switching (quits and
+// reopens Claude): --carry-sidebar <account name>.
+if let i = CommandLine.arguments.firstIndex(of: "--carry-sidebar"), i + 1 < CommandLine.arguments.count {
+    let name = CommandLine.arguments[i + 1]
+    guard let p = loadProfiles().first(where: { $0.name == name && !$0.active }) else {
+        print("no parked account named \(name)"); exit(1)
+    }
+    let wasRunning = !testMode && isRunning(claudeBundle)
+    if wasRunning && !quitApp(claudeBundle) { print("Claude did not quit, so nothing was changed."); exit(1) }
+    if wasRunning { Thread.sleep(forTimeInterval: 1) }
+    do { try syncSidebar(from: p.dir, to: activeDir); print("ok") } catch { print(error.localizedDescription) }
+    if wasRunning { run(args: ["open", "-b", claudeBundle]) }
+    exit(0)
+}
+
 // Repairs the session folders from a terminal. --force skips quitting Claude.
 if CommandLine.arguments.contains("--sync-sessions") {
     print(repairSessions(force: CommandLine.arguments.contains("--force")) ?? "ok")

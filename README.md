@@ -239,7 +239,8 @@ ACCOUNT_SWITCHER_ROOT="$T" ~/Applications/"Account Switcher.app"/Contents/MacOS/
 # add  -shareCodeSessions NO  to run the same swap without session sharing
 ```
 
-`--sync-sessions` repairs and syncs the Code session folders now (it quits and reopens Claude;
+`--carry-sidebar <account>` copies a parked account's sidebar layout into the active one without
+switching (it quits and reopens Claude). `--sync-sessions` repairs and syncs the Code session folders now (it quits and reopens Claude;
 add `--force` to leave Claude running). `--dump` prints what the menu would show; `--setup` and `--settings` open those windows at launch.
 `ACCOUNT_SWITCHER_PATH=/usr/bin:/bin` (plus an empty `ACCOUNT_SWITCHER_ROOT`) shows the setup
 window as it looks on a Mac without the helpers.
