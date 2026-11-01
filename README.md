@@ -218,6 +218,20 @@ in. If an existing account asks again after a Claude update, sign in again; its 
 **Codex keeps flipping between accounts.** Both accounts are near their limits and Auto-Switch
 is bouncing between them. Turn off **Codex Auto-Switch** and pick one manually.
 
+## Quickstart for contributors
+
+Needs macOS 13+ and Xcode Command Line Tools (`xcode-select --install`). No package manager, no
+dependencies: the app is three Swift files compiled with `swiftc`.
+
+```bash
+git clone https://github.com/berkboz/account-switcher.git && cd account-switcher
+./build.sh                                   # build + ad-hoc sign into ~/Applications
+"$HOME/Applications/Account Switcher.app/Contents/MacOS/AccountSwitcher" --dump   # print what the menu would show
+```
+
+Access you need: none to build and test (public repo). Releasing needs an Apple Developer ID
+certificate (maintainer only). Read [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md) before changing code.
+
 ## Development
 
 ```bash
