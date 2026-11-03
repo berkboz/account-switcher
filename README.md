@@ -90,6 +90,9 @@ group, pinned and starred sessions, and project order. Claude keeps these per ac
 account you just left is copied into all three places of the one you switch to. The very first time,
 the account with more grouped sessions keeps its layout instead, so an organized sidebar is never
 overwritten by an empty one. The replaced layout is saved in the same `conflicts` folder.
+Claude also syncs the layout to each account on claude.ai and would restore that copy at launch,
+so the switcher marks the carried layout as not yet uploaded: Claude keeps it and replaces the
+account's synced copy with it.
 
 Sessions whose folder was moved and replaced by a symlink are repaired on each switch: their
 path is pointed at the real folder and their transcript moved there, so Claude does not reopen

@@ -515,6 +515,10 @@ func resolveSessionPaths(in active: String) throws {
 // layout (the one just used) is copied into the incoming one. The very first time, the layout with
 // more grouped sessions wins instead, so an organized account is never overwritten by a bare one.
 // Replaced values are kept in `conflictsDir`.
+// Since Claude 4.42 the sidebar store is also synced to the account on claude.ai. At launch the
+// server's groups replace the local ones and drop every assignment to a group id it does not know,
+// which is all of a carried layout's. A "ccd-sync-pending" flag naming the account makes Claude keep
+// the local store and upload it instead; Claude honors it only for the folder's own sync owner.
 
 let sidebarScopedPrefs = ["dframe-group-scopes", "dframe-code-sections"]
 let sidebarAccountPrefs = ["code-projects-order"]
@@ -523,6 +527,9 @@ let sidebarPlainPrefs = ["dframe-local-slice", "starred-local-code-sessions", "s
 let sidebarStoreFields = ["dframe-group-scopes": "customGroupsByScope", "dframe-code-sections": "codeSidebarByScope"]
 let sidebarStore = "dframe-store"
 let sidebarMarker = "\(appSupport)/Account Switcher/sidebar-sync-v3.json"
+/// Local Storage items of Claude's server sync of the sidebar store (plain strings).
+let sidebarSyncPending = "ccd-sync-pending:ccd/\(sidebarStore)"
+let sidebarSyncOwner = "ccd-sync-owner"
 
 /// The account and organization a data folder is signed in to, as Claude scopes its prefs.
 func sidebarAccount(_ dir: String) -> (account: String, org: String)? {
@@ -542,7 +549,7 @@ struct SidebarState {
     var store: [String: Any]?               // the sidebar store, {"state": …, "version": …}
 
     static let localKeys = Set((sidebarScopedPrefs + sidebarPlainPrefs).map { localStorageKey("LSS-persisted.\($0)") }
-                               + [localStorageKey(sidebarStore)])
+                               + [sidebarStore, sidebarSyncPending, sidebarSyncOwner].map(localStorageKey))
 
     init?(_ dir: String, account: String) throws {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: "\(dir)/claude_desktop_config.json")),
@@ -560,6 +567,9 @@ struct SidebarState {
     }
 
     var storeState: [String: Any]? { store?["state"] as? [String: Any] }
+
+    /// A plain Local Storage item.
+    func local(_ name: String) -> String? { db?.get(localStorageKey(name)).flatMap(localStorageString) }
 
     /// A scoped pref for `scope`: what the sidebar store shows, else the config's copy.
     func scoped(_ pref: String, _ scope: String) -> Any? {
@@ -606,9 +616,15 @@ func syncSidebar(from outgoing: String, to incoming: String) throws {
     let differs = layout.contains { c in
         !jsonEqual(c.scope.map { dst.scoped(c.key, $0) } ?? (c.key == "dframe-local-slice" ? dst.localSlice : dst.prefs[c.key]), c.value)
     }
-    if differs && !(firstSync && dst.grouped(to) > src.grouped(from)) {
+    let keepIncoming = firstSync && dst.grouped(to) > src.grouped(from)
+    if !keepIncoming, let owner = dst.local(sidebarSyncOwner), !owner.isEmpty, owner != b.account {
+        throw LevelDBError("its sidebar sync belongs to another account, so the layout was not carried")
+    }
+    let pending = (localStorageKey(sidebarSyncPending), localStorageBytes(to))
+    if differs && !keepIncoming {
         let now = Int(Date().timeIntervalSince1970 * 1000)
         var replaced: [String: Any] = [:]
+        if let old = dst.local(sidebarSyncPending) { replaced[sidebarSyncPending] = old }
         for c in layout {
             if let scope = c.scope {
                 var scopes = dst.prefs[c.key] as? [String: Any] ?? [:]
@@ -645,6 +661,7 @@ func syncSidebar(from outgoing: String, to incoming: String) throws {
                 store["state"] = state
                 try put(sidebarStore, store)
             }
+            writes.append(pending)
             try db.put(writes)
         }
 
@@ -660,6 +677,9 @@ func syncSidebar(from outgoing: String, to incoming: String) throws {
         try JSONSerialization.data(withJSONObject: dst.config, options: [.prettyPrinted, .withoutEscapingSlashes])
             .write(to: URL(fileURLWithPath: path), options: .atomic)
         try fm.setAttributes([.posixPermissions: mode], ofItemAtPath: path)
+    } else if !keepIncoming, var db = dst.db, dst.local(sidebarSyncPending) != to {
+        // The layout is already here, but the server's copy may still differ from it.
+        try db.put([pending])
     }
     try fm.createDirectory(atPath: (sidebarMarker as NSString).deletingLastPathComponent,
                            withIntermediateDirectories: true)
