@@ -258,7 +258,8 @@ ACCOUNT_SWITCHER_ROOT="$T" ~/Applications/"Account Switcher.app"/Contents/MacOS/
 
 `--carry-sidebar <account>` copies a parked account's sidebar layout into the active one without
 switching (it quits and reopens Claude). `--sync-sessions` repairs and syncs the Code session folders now (it quits and reopens Claude;
-add `--force` to leave Claude running). `--dump` prints what the menu would show; `--setup` and `--settings` open those windows at launch.
+add `--force` to leave Claude running). Both commands that quit Claude carry on in the background and
+report with a notification, so they also work from the terminal in Claude's Code tab. `--dump` prints what the menu would show; `--setup` and `--settings` open those windows at launch.
 `ACCOUNT_SWITCHER_PATH=/usr/bin:/bin` (plus an empty `ACCOUNT_SWITCHER_ROOT`) shows the setup
 window as it looks on a Mac without the helpers.
 

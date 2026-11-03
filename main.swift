@@ -1646,25 +1646,47 @@ if CommandLine.arguments.contains("--dump") {
     exit(0)
 }
 
+/// The commands below quit Claude, and a terminal in Claude's Code tab is closed with it, which
+/// killed the command before it could finish and reopen Claude. So they run again as a new
+/// instance of the app, outside the terminal, and report the result in a notification.
+let detached = CommandLine.arguments.contains("--detached")
+func detachFromTerminal() {
+    guard !testMode, !detached else { return }
+    let r = run(args: ["open", "-n", "-g", Bundle.main.bundlePath, "--args"]
+                + CommandLine.arguments.dropFirst() + ["--detached"])
+    print(r.ok ? "Running in the background: Claude quits and reopens, and a notification shows the result."
+               : "Could not start it in the background: \(r.output)")
+    exit(r.ok ? 0 : 1)
+}
+/// Ends a command: `failure` nil means it worked.
+func finish(_ failure: String?, done: String = "Done.") -> Never {
+    print(failure ?? "ok")
+    if detached { notify("Account Switcher", failure ?? done) }
+    exit(failure == nil ? 0 : 1)
+}
+
 // Copies a parked account's sidebar layout into the active one without switching (quits and
 // reopens Claude): --carry-sidebar <account name>.
 if let i = CommandLine.arguments.firstIndex(of: "--carry-sidebar"), i + 1 < CommandLine.arguments.count {
     let name = CommandLine.arguments[i + 1]
     guard let p = loadProfiles().first(where: { $0.name == name && !$0.active }) else {
-        print("no parked account named \(name)"); exit(1)
+        finish("No parked account named \(name).")
     }
+    detachFromTerminal()
     let wasRunning = !testMode && isRunning(claudeBundle)
-    if wasRunning && !quitApp(claudeBundle) { print("Claude did not quit, so nothing was changed."); exit(1) }
+    if wasRunning && !quitApp(claudeBundle) { finish("Claude did not quit, so nothing was changed.") }
     if wasRunning { Thread.sleep(forTimeInterval: 1) }
-    do { try syncSidebar(from: p.dir, to: activeDir); print("ok") } catch { print(error.localizedDescription) }
+    var failure: String?
+    do { try syncSidebar(from: p.dir, to: activeDir) } catch { failure = "Carrying the sidebar failed: \(error.localizedDescription)" }
     if wasRunning { run(args: ["open", "-b", claudeBundle]) }
-    exit(0)
+    finish(failure, done: "Carried the sidebar layout of \(name).")
 }
 
 // Repairs the session folders from a terminal. --force skips quitting Claude.
 if CommandLine.arguments.contains("--sync-sessions") {
-    print(repairSessions(force: CommandLine.arguments.contains("--force")) ?? "ok")
-    exit(0)
+    let force = CommandLine.arguments.contains("--force")
+    if !force { detachFromTerminal() }
+    finish(repairSessions(force: force), done: "Code sessions repaired.")
 }
 
 // Needs ACCOUNT_SWITCHER_ROOT. Add `-shareCodeSessions NO` to test without session sharing.
